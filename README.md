@@ -50,6 +50,33 @@ Flags: `--threads` (real pthreads + atomic RC + monitors), `--freestanding`
 `-o <out>` (output path). Set `FASTLLVM_HEAPSTATS=1` at run time to print the
 heap balance.
 
+## Dynamic loading & self-modification (open-world extension)
+
+An optional open-world layer lets a compiled binary load new native code at run
+time and modify itself — all as native machine code, **no VM and no JIT**. See
+`DYNAMIC-RUNTIME-PLAN.md` (design), `PHASE-0-PLAN.md` (metadata substrate), and
+`MC-PAPER-TEST.md` (why real Modded-Minecraft/Paper remain out of scope — they need
+a full JVM + runtime bytecode generation).
+
+- `--emit-module` — compile to a loadable native module (`.so`); the entry class needs
+  `static int fjcMain()` or a standard `main(String[])`.
+- `--dynamic` — build a host binary that can load such modules at run time (open world:
+  cycle collector always on, CHA devirtualization off, mutable vtables).
+- `--weave Mixin:Target` — compile-time mixin weaving (overwrite a target's methods).
+
+Reserved `__fjc_*` intrinsics (declare as `static native int`), the mechanisms behind
+them, and their tests:
+- `__fjc_load_and_run(String soPath)` — M1: `dlopen` a prebuilt module and run it
+  (`tests/m1.sh`).
+- `__fjc_load_jar_and_run(String jar)` — M2: compile a bytecode jar to a native module
+  on first use (cached; `FASTJAVAC`/`FASTJAVAC_CACHE` env), then run it (`tests/m2.sh`).
+- `__fjc_redefine(target, source, "name desc")` — redefine a method by vtable pointer
+  swap (`tests/p2.sh`).
+- `__fjc_hotpatch(target, source, "name desc")` — redirect a method's native entry by
+  binary trampoline patching (`tests/p5.sh`).
+- `__fjc_field_count/method_count/instance_size(String cls)` — read a class's own
+  runtime `FjcClass` metadata (`examples/FjcIntro.java`).
+
 ## Tests
 
 The regression suite compiles each example with `javac` + `fastjavac`, runs it,

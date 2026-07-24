@@ -1,7 +1,26 @@
 # Design Plan: Dynamic Loading & Self-Modification without a VM or JIT
 
 **Date:** 2026-07-25
-**Status:** Plan only — no implementation.
+**Status:** IMPLEMENTED — Phases 0–5 all landed and tested (see below). Each phase has
+an end-to-end test in `tests/` wired into `tests/run.sh` (73 passed, 0 failed), all
+balancing the 0-live-heap oracle. The MC/Paper evaluation is in `MC-PAPER-TEST.md`.
+
+**Implementation status by phase:**
+- Phase 0 (ABI freeze + runtime FjcClass metadata/registry + `__fjc_*` introspection): DONE.
+- Phase 1 / M1 (native module ABI: `--emit-module` → `.so`, `--dynamic` host, `dlopen`
+  loader `jrt_load_and_run`): DONE (`tests/m1.sh`).
+- Phase 2 (runtime method redefinition by vtable pointer swap `jrt_redefine`;
+  open-world = devirt off + mutable vtables): DONE (`tests/p2.sh`).
+- Phase 3 (compile-time mixin weaving `--weave Mixin:Target`): DONE (`tests/p3.sh`).
+  Guarded devirtualization deferred as a perf optimization (plain vtable dispatch is
+  already correct).
+- Phase 4 / M2 (compile-on-load cache: `jrt_load_jar_and_run` → fastjavac subprocess →
+  cached `.so` → run): DONE (`tests/m2.sh`).
+- Phase 5 (binary trampoline patching `jrt_hotpatch`, self-modifying machine code):
+  DONE (`tests/p5.sh`). Single-threaded scope; cross-thread safepoints/OSR deferred.
+
+Original plan text follows.
+
 **Hard constraint:** No virtual machine (no bytecode interpreter) and, as far as
 possible, **no in-process JIT**. All code must run as ordinary native machine code
 directly on the CPU at all times.
