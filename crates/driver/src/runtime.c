@@ -2430,6 +2430,111 @@ int32_t jrt_record_memeq(void *a, void *b, int32_t inst, int64_t field_bytes) {
     return jrt_memcmp((char *)a + 16, (char *)b + 16, field_bytes) == 0;
 }
 
+/* ==== Phase 0: self-describing runtime class metadata (FjcClass registry) ====
+ * Layout frozen under FJC_ABI_VERSION; MUST match the FjcClass emission in
+ * crates/backend/src/lib.rs and crates/ir::FJC_ABI_VERSION. The backend emits one
+ * FjcClass per class plus the external `fjc_classes` table; these accessors resolve
+ * classes/methods by name at runtime. This is the substrate for dynamic module
+ * loading (M1/M2). Bumping the layout/ordering requires bumping FJC_ABI_VERSION on
+ * both sides. */
+#define FJC_ABI_VERSION 1
+
+typedef struct {
+    const char *name;
+    const char *desc;   /* JVM field descriptor (approximate for sub-int/prim arrays) */
+    uint32_t offset;    /* byte offset from object base */
+    uint32_t is_ref;
+} FjcField;
+
+typedef struct {
+    const char *name;
+    const char *desc;
+    const void *code;         /* native entry (mangled symbol) or NULL if abstract/pruned */
+    int32_t vtable_index;     /* -1 if non-virtual */
+    uint32_t flags;           /* bit0 static, bit1 abstract/native */
+} FjcMethod;
+
+typedef struct FjcClass {
+    uint32_t abi_version;     /* == FJC_ABI_VERSION */
+    uint32_t flags;           /* bit0 interface, bit2 has_clinit */
+    const char *name;         /* dotted name (Class.getName style) */
+    const struct FjcClass *super;
+    const void *vtable;       /* == @vt.<class>, or NULL if not instantiated */
+    uint32_t vtable_len;
+    uint32_t instance_size;   /* bytes incl. the 2-word header */
+    uint32_t n_ifaces;
+    uint32_t n_fields;
+    uint32_t n_methods;
+    uint32_t n_ref_offsets;
+    const struct FjcClass *const *ifaces;
+    const FjcField *fields;
+    const FjcMethod *methods;
+    const uint32_t *ref_offsets;
+} FjcClass;
+
+/* Emitted by the backend with external linkage (always present — the backend emits
+ * an empty table for class-less programs). Unreferenced in pure-AOT programs, so
+ * --gc-sections drops the whole registry when nothing introspects. */
+extern const FjcClass *const fjc_classes[];
+extern const uint32_t fjc_classes_len;
+
+static int jrt_cstreq(const char *a, const char *b) {
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+
+/* Resolve a class descriptor by dotted name. Linear scan (table is small; a startup
+ * hash index is a later optimization). NULL if not found. */
+const FjcClass *jrt_class_by_name(const char *dotted) {
+    for (uint32_t i = 0; i < fjc_classes_len; i++) {
+        const FjcClass *c = fjc_classes[i];
+        if (c && c->abi_version == FJC_ABI_VERSION && jrt_cstreq(c->name, dotted)) return c;
+    }
+    return NULL;
+}
+
+const FjcMethod *jrt_method(const FjcClass *c, const char *name, const char *desc) {
+    if (!c) return NULL;
+    for (uint32_t i = 0; i < c->n_methods; i++)
+        if (jrt_cstreq(c->methods[i].name, name) && jrt_cstreq(c->methods[i].desc, desc))
+            return &c->methods[i];
+    return NULL;
+}
+
+int32_t jrt_vtable_index_of(const FjcClass *c, const char *name, const char *desc) {
+    const FjcMethod *m = jrt_method(c, name, desc);
+    return m ? m->vtable_index : -1;
+}
+
+/* Resolve a class from a Java String (JStr, not NUL-terminated) — compares by length.
+ * Backs the __fjc_* introspection intrinsics. */
+static const FjcClass *fjc_by_jstr(const void *jstr) {
+    const JStr *s = (const JStr *)jstr;
+    if (!s) return NULL;
+    for (uint32_t i = 0; i < fjc_classes_len; i++) {
+        const FjcClass *c = fjc_classes[i];
+        if (!c) continue;
+        const char *n = c->name;
+        int64_t k = 0;
+        while (k < s->len && n[k] && (char)s->bytes[k] == n[k]) k++;
+        if (k == s->len && n[k] == '\0') return c;
+    }
+    return NULL;
+}
+
+int32_t jrt_fjc_field_count(const void *jstr) {
+    const FjcClass *c = fjc_by_jstr(jstr);
+    return c ? (int32_t)c->n_fields : -1;
+}
+int32_t jrt_fjc_method_count(const void *jstr) {
+    const FjcClass *c = fjc_by_jstr(jstr);
+    return c ? (int32_t)c->n_methods : -1;
+}
+int32_t jrt_fjc_instance_size(const void *jstr) {
+    const FjcClass *c = fjc_by_jstr(jstr);
+    return c ? (int32_t)c->instance_size : -1;
+}
+
 int32_t jrt_instanceof(void *obj, void *target_td) {
     if (!obj) return 0;
     JObjHeader *h = (JObjHeader *)obj;

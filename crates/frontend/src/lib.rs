@@ -2723,6 +2723,24 @@ fn lower_block(
                     });
                     continue;
                 }
+                // Compiler introspection intrinsics: any static call named `__fjc_*`
+                // with signature (String)I maps to a jrt_ registry accessor,
+                // regardless of the declaring class. Lets a program query its own
+                // FjcClass metadata at runtime (Phase 0 / the `__fjc_` namespace is
+                // reserved, analogous to GCC `__builtin_`).
+                if name.starts_with("__fjc_") && desc == "(Ljava/lang/String;)I" {
+                    let func = match name {
+                        "__fjc_field_count" => "jrt_fjc_field_count",
+                        "__fjc_method_count" => "jrt_fjc_method_count",
+                        "__fjc_instance_size" => "jrt_fjc_instance_size",
+                        _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}"))),
+                    };
+                    let arg = pop!();
+                    let dest = push!(Ty::I32, Rvalue::Use(Operand::ConstI32(0)));
+                    stmts.pop(); // placeholder
+                    stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args: vec![Operand::Copy(arg)] });
+                    continue;
+                }
                 // Value-producing runtime intrinsics (parse/Math/time). clang -O2
                 // inlines them (shared translation unit with runtime.c).
                 let simple: Option<(&str, Ty)> = match (class, name, desc) {
