@@ -870,9 +870,15 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
         for (_, _, sym) in ctx.vtable_slots(class) {
             entries.push(sym_entry(sym));
         }
+        // Open-world (--dynamic): the vtable is a MUTABLE global so a runtime
+        // redefinition can repoint a method slot (jrt_redefine). Its address
+        // escapes via the external @fjc_classes table, so LLVM keeps slot loads
+        // conservative. Closed-world builds keep it an immutable constant (the slot
+        // load can then fold to a direct call).
+        let vt_decl = if program.dynamic { "global" } else { "unnamed_addr constant" };
         writeln!(
             w,
-            "@vt.{} = internal unnamed_addr constant [{} x ptr] [{}]",
+            "@vt.{} = internal {vt_decl} [{} x ptr] [{}]",
             sanitize(class),
             entries.len(),
             entries.join(", "),

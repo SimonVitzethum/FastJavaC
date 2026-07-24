@@ -2564,6 +2564,48 @@ int32_t jrt_fjc_instance_size(const void *jstr) {
     return c ? (int32_t)c->instance_size : -1;
 }
 
+static void jstr_to_cstr(const void *js, char *buf, int cap) {
+    const JStr *s = (const JStr *)js;
+    if (!s || s->len < 0 || s->len >= cap) { buf[0] = '\0'; return; }
+    for (int64_t i = 0; i < s->len; i++) buf[i] = (char)s->bytes[i];
+    buf[s->len] = '\0';
+}
+
+/* ---- Phase 2: runtime method redefinition by vtable-slot pointer swap --------
+ * Repoint `target.<name><desc>`'s vtable slot to the native implementation that
+ * the (already loaded) `source` class provides for the SAME name+desc. No code is
+ * generated — this is a single pointer store into a mutable vtable (only emitted
+ * for --dynamic builds). `sig` is "name desc" (space-separated), e.g. "greet ()I".
+ * Subsequent virtual calls dispatch to the new code; in-flight activations finish
+ * on the old code. Returns 0 on success, negative on error. */
+int32_t jrt_redefine(const void *target_j, const void *source_j, const void *sig_j) {
+    char target[256], source[256], sig[256];
+    jstr_to_cstr(target_j, target, sizeof target);
+    jstr_to_cstr(source_j, source, sizeof source);
+    jstr_to_cstr(sig_j, sig, sizeof sig);
+    if (!target[0] || !source[0] || !sig[0]) return -1;
+
+    char *sp = sig;
+    while (*sp && *sp != ' ') sp++;
+    if (*sp != ' ') return -1;
+    *sp = '\0';
+    const char *mname = sig;
+    const char *mdesc = sp + 1;
+
+    const FjcClass *t = jrt_class_by_name(target);
+    if (!t || !t->vtable) return -2;
+    int32_t slot = jrt_vtable_index_of(t, mname, mdesc);
+    if (slot < 0 || (uint32_t)slot >= t->vtable_len) return -3;
+
+    const FjcClass *s = jrt_class_by_name(source);
+    const FjcMethod *m = jrt_method(s, mname, mdesc);
+    if (!m || !m->code) return -4;
+
+    void **vt = (void **)t->vtable;
+    vt[slot] = (void *)m->code;
+    return 0;
+}
+
 /* ---- M1: load a native module (.so) and run its entry point ----------------
  * dlopen the module (RTLD_LOCAL so its own symbols stay private; its undefined
  * jrt_* references resolve against this host, which is linked -rdynamic), verify

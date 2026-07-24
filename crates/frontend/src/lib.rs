@@ -2728,21 +2728,27 @@ fn lower_block(
                 // regardless of the declaring class. Lets a program query its own
                 // FjcClass metadata at runtime (Phase 0 / the `__fjc_` namespace is
                 // reserved, analogous to GCC `__builtin_`).
-                if name.starts_with("__fjc_") && desc == "(Ljava/lang/String;)I" {
-                    let func = match name {
-                        "__fjc_field_count" => "jrt_fjc_field_count",
-                        "__fjc_method_count" => "jrt_fjc_method_count",
-                        "__fjc_instance_size" => "jrt_fjc_instance_size",
-                        // M1: load a native module (.so) at the given path and run
-                        // its fjc_module_main; returns the module's result (or a
-                        // negative loader error code).
-                        "__fjc_load_and_run" => "jrt_load_and_run",
-                        _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}"))),
+                if name.starts_with("__fjc_") {
+                    // (jrt function, number of String parameters). All return int.
+                    let (func, nargs): (&str, usize) = match (name, desc) {
+                        ("__fjc_field_count", "(Ljava/lang/String;)I") => ("jrt_fjc_field_count", 1),
+                        ("__fjc_method_count", "(Ljava/lang/String;)I") => ("jrt_fjc_method_count", 1),
+                        ("__fjc_instance_size", "(Ljava/lang/String;)I") => ("jrt_fjc_instance_size", 1),
+                        // M1: load a native module (.so) and run its fjc_module_main.
+                        ("__fjc_load_and_run", "(Ljava/lang/String;)I") => ("jrt_load_and_run", 1),
+                        // Phase 2: repoint target.<sig>'s vtable slot to the impl the
+                        // (loaded) source class provides. sig = "name desc".
+                        ("__fjc_redefine", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I") => ("jrt_redefine", 3),
+                        _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
-                    let arg = pop!();
+                    let mut args: Vec<Operand> = Vec::new();
+                    for _ in 0..nargs {
+                        args.push(Operand::Copy(pop!()));
+                    }
+                    args.reverse();
                     let dest = push!(Ty::I32, Rvalue::Use(Operand::ConstI32(0)));
                     stmts.pop(); // placeholder
-                    stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args: vec![Operand::Copy(arg)] });
+                    stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args });
                     continue;
                 }
                 // Value-producing runtime intrinsics (parse/Math/time). clang -O2

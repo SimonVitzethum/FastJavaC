@@ -178,7 +178,12 @@ pub fn run(program: &mut Program) -> Stats {
     stats.virtual_sites = sites.len();
 
     // --- CHA/RTA devirtualization: sites with exactly one target ---
-    for f in &mut program.functions {
+    // Skipped in open-world (--dynamic) builds: a later-loaded module can add a
+    // subclass that overrides the method, so a closed-world "single target" is not
+    // actually monomorphic. Calls stay CallVirtual (mutable vtable dispatch), which
+    // is also what makes runtime method redefinition observable (Phase 2).
+    let dyn_mode = program.dynamic;
+    for f in program.functions.iter_mut().filter(|_| !dyn_mode) {
         for bb in &mut f.blocks {
             let mut i = 0;
             while i < bb.statements.len() {

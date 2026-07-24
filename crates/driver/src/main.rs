@@ -102,6 +102,10 @@ fn main() {
 
     let mut program = fastllvm_ir::Program::default();
     program.main_class = main_class;
+    // Open-world host: disables CHA devirtualization and makes vtables mutable so
+    // loaded modules can add subclasses / redefine methods (Phase 2). Modules
+    // themselves stay closed-world-optimized over their own classes.
+    program.dynamic = dynamic;
     for (path, cf) in &classfiles {
         if let Err(e) = fastllvm_frontend::register_class(cf, &mut program) {
             return die(&format!("{}: {e}", path.display()));

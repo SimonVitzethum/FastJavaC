@@ -452,6 +452,12 @@ pub struct Program {
     /// generated/native glue invisible to RTA (e.g. a Vire `spawn` worker, called
     /// from its C shim via `jrt_spawn`). Analogous to the Runnable.run() roots.
     pub exported: Vec<String>,
+    /// Open-world (`--dynamic`) build: dynamically loaded modules may add
+    /// subclasses/override methods at runtime, so closed-world CHA
+    /// devirtualization is unsound and vtables must stay mutable (a redefinition
+    /// repoints a slot). Set by the driver; the solver skips devirt and the
+    /// backend emits mutable vtables when true. See DYNAMIC-RUNTIME-PLAN.md §3.
+    pub dynamic: bool,
 }
 
 impl Program {
