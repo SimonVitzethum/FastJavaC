@@ -23,6 +23,9 @@ fn main() {
     // such modules at runtime (see DYNAMIC-RUNTIME-PLAN.md §5, PHASE-0-PLAN.md).
     let mut emit_module = false;
     let mut dynamic = false;
+    // Phase 3: compile-time mixin weaving. Each --weave Mixin:Target overwrites the
+    // target class's methods with the mixin's before codegen (dotted names).
+    let mut weaves: Vec<(String, String)> = Vec::new();
     let mut main_override: Option<String> = None;
     let mut raw_inputs: Vec<PathBuf> = Vec::new();
 
@@ -45,6 +48,13 @@ fn main() {
             "--threads" => threads = true,
             "--emit-module" => emit_module = true,
             "--dynamic" => dynamic = true,
+            "--weave" => match args.next() {
+                Some(spec) => match spec.split_once(':') {
+                    Some((m, t)) => weaves.push((m.replace('.', "/"), t.replace('.', "/"))),
+                    None => die("--weave expects Mixin:Target"),
+                },
+                None => die("--weave requires a Mixin:Target argument"),
+            },
             "-h" | "--help" => {
                 println!("Usage: fastjavac [-o BIN] [--main CLASS] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] [--emit-module] [--dynamic] (CLASS.class | LIB.jar) ...");
                 println!("  --emit-module  compile to a loadable native module (.so); entry class needs `static int fjcMain()`");
@@ -115,6 +125,19 @@ fn main() {
     for (path, cf) in &classfiles {
         if let Err(e) = fastllvm_frontend::lower_class(cf, &mut program) {
             return die(&format!("{}: {e}", path.display()));
+        }
+    }
+
+    // Phase 3: weave mixins over their targets before the solver runs, so the
+    // combined class is optimized and lowered as one.
+    for (mixin, target) in &weaves {
+        let n = fastllvm_solver::weave_mixin(&mut program, mixin, target);
+        if n == 0 {
+            return die(&format!(
+                "--weave {}:{}: no overlapping methods woven (check class/method names)",
+                mixin.replace('/', "."),
+                target.replace('/', "."),
+            ));
         }
     }
 

@@ -229,6 +229,7 @@ thtest threads_par   200000 Threads
 # --- M1/P2: native module loading + runtime method redefinition ---
 if sh "$root/tests/m1.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/p2.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/p3.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 
 echo "---"
 echo "$pass passed, $fail failed"
