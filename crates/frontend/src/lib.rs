@@ -2736,6 +2736,8 @@ fn lower_block(
                         ("__fjc_instance_size", "(Ljava/lang/String;)I") => ("jrt_fjc_instance_size", 1),
                         // M1: load a native module (.so) and run its fjc_module_main.
                         ("__fjc_load_and_run", "(Ljava/lang/String;)I") => ("jrt_load_and_run", 1),
+                        // M2: compile a .class/.jar to a native module (cached) and run it.
+                        ("__fjc_load_jar_and_run", "(Ljava/lang/String;)I") => ("jrt_load_jar_and_run", 1),
                         // Phase 2: repoint target.<sig>'s vtable slot to the impl the
                         // (loaded) source class provides. sig = "name desc".
                         ("__fjc_redefine", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I") => ("jrt_redefine", 3),

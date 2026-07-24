@@ -116,6 +116,7 @@ fn main() {
     // loaded modules can add subclasses / redefine methods (Phase 2). Modules
     // themselves stay closed-world-optimized over their own classes.
     program.dynamic = dynamic;
+    program.module = emit_module;
     for (path, cf) in &classfiles {
         if let Err(e) = fastllvm_frontend::register_class(cf, &mut program) {
             return die(&format!("{}: {e}", path.display()));
@@ -223,18 +224,35 @@ fn main() {
             Some(c) => c.clone(),
             None => return die("--emit-module requires an entry class (JAR Main-Class or --main) with `static int fjcMain()`"),
         };
-        let has_entry = program
-            .class(&entry)
+        let entry_class = program.class(&entry);
+        let has_fjcmain = entry_class
             .map(|c| c.methods.iter().any(|m| m.name == "fjcMain" && m.desc == "()I" && m.is_static))
             .unwrap_or(false);
-        if !has_entry {
-            return die(&format!("entry class {} has no `public static int fjcMain()`", entry.replace('/', ".")));
-        }
-        let sym = fastllvm_ir::mangle(&entry, "fjcMain", "()I");
+        let has_main = entry_class
+            .map(|c| c.methods.iter().any(|m| m.name == "main" && m.desc == "([Ljava/lang/String;)V" && m.is_static))
+            .unwrap_or(false);
+        // Entry wrapper: prefer `static int fjcMain()`; otherwise wrap the standard
+        // `static void main(String[])` (compiled as the module's own @main, which
+        // runs the class initializers + main + static-field release, then returns 0).
+        let entry_body = if has_fjcmain {
+            let sym = fastllvm_ir::mangle(&entry, "fjcMain", "()I");
+            format!("extern int32_t {sym}(void);\nint32_t fjc_module_main(void) {{ return {sym}(); }}\n")
+        } else if has_main {
+            // The backend named the startup wrapper (clinit + main + static release)
+            // `fjc_module_run` in module mode — call it directly (no `main` symbol,
+            // so no collision with the host's main).
+            "extern int32_t fjc_module_run(void);\n\
+             int32_t fjc_module_main(void) { return fjc_module_run(); }\n"
+                .to_string()
+        } else {
+            return die(&format!(
+                "entry class {} has neither `static int fjcMain()` nor `static void main(String[])`",
+                entry.replace('/', ".")
+            ));
+        };
         let shim = format!(
             "#include <stdint.h>\n\
-             extern int32_t {sym}(void);\n\
-             int32_t fjc_module_main(void) {{ return {sym}(); }}\n\
+             {entry_body}\
              const uint32_t fjc_module_abi = {abi}u;\n\
              void fjc_module_init(void *host) {{ (void)host; }}\n",
             abi = fastllvm_ir::FJC_ABI_VERSION,

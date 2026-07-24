@@ -458,6 +458,11 @@ pub struct Program {
     /// repoints a slot). Set by the driver; the solver skips devirt and the
     /// backend emits mutable vtables when true. See DYNAMIC-RUNTIME-PLAN.md §3.
     pub dynamic: bool,
+    /// `--emit-module` build: the output is a loadable shared object, not an
+    /// executable. The backend emits the startup wrapper (clinit chain + entry +
+    /// static release) under the symbol `fjc_module_run` instead of `main`, so it
+    /// does NOT collide with the host's `main` in the global dynamic scope.
+    pub module: bool,
 }
 
 impl Program {

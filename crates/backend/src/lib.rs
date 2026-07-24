@@ -1223,7 +1223,11 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     }
 
     if defined.contains("java_main") {
-        writeln!(w, "define i32 @main() {{").unwrap();
+        // In module (--emit-module) builds the startup wrapper is named
+        // `fjc_module_run`, not `main`, so it does not collide with the host's
+        // `main` in the global dynamic scope when the module is dlopen'd.
+        let entry_name = if program.module { "fjc_module_run" } else { "main" };
+        writeln!(w, "define i32 @{entry_name}() {{").unwrap();
         // Vtable pointer for String/wrapper objects created at runtime —
         // only if the String class occurs at all (Vire programs without
         // strings do not define `@vt.java_lang_String`).

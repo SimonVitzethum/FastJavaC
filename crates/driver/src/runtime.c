@@ -2614,13 +2614,16 @@ int32_t jrt_redefine(const void *target_j, const void *source_j, const void *sig
  * Requires --dynamic (libdl + exported host symbols). */
 #if defined(FASTLLVM_DYNAMIC) && !defined(FASTLLVM_FREESTANDING)
 #include <dlfcn.h>
-int32_t jrt_load_and_run(const void *jstr) {
-    const JStr *s = (const JStr *)jstr;
-    if (!s || s->len < 0 || s->len >= 4096) return -1;
-    char path[4096];
-    for (int64_t i = 0; i < s->len; i++) path[i] = (char)s->bytes[i];
-    path[s->len] = '\0';
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
+/* Load an already-built native module (.so) by path, verify its ABI, register its
+ * classes, and run fjc_module_main. Shared by the M1 and M2 entry points. */
+static int32_t load_so_and_run(const char *path) {
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) return -10;
     const uint32_t *abi = (const uint32_t *)dlsym(h, "fjc_module_abi");
@@ -2634,8 +2637,84 @@ int32_t jrt_load_and_run(const void *jstr) {
     if (!entry) { dlclose(h); return -12; }
     return entry();
 }
+
+/* M1: load a prebuilt native module (.so) at the given path and run it. */
+int32_t jrt_load_and_run(const void *jstr) {
+    char path[4096];
+    jstr_to_cstr(jstr, path, sizeof path);
+    if (!path[0]) return -1;
+    return load_so_and_run(path);
+}
+
+/* ---- M2: compile-on-load cache -------------------------------------------------
+ * Turn a .class/.jar of bytecode into a native module ahead of load: hash the input
+ * (+ ABI version) into a cache key, and on a miss invoke `fastjavac --emit-module`
+ * in a subprocess (this IS ahead-of-time compilation, in a separate process — not an
+ * in-process JIT), caching the resulting .so, then load+run it via the M1 path. The
+ * module always runs as native machine code. Requires a fastjavac toolchain at
+ * runtime (FASTJAVAC env or PATH); cache dir from FASTJAVAC_CACHE / $HOME/.cache. */
+static uint64_t fnv1a_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint64_t h = 1469598103934665603ULL;
+    int c;
+    while ((c = fgetc(f)) != EOF) { h ^= (unsigned char)c; h *= 1099511628211ULL; }
+    fclose(f);
+    return h ? h : 1;
+}
+
+static void ensure_dir(const char *path) {
+    /* mkdir -p, component by component. */
+    char buf[4096];
+    size_t n = strlen(path);
+    if (n >= sizeof buf) return;
+    memcpy(buf, path, n + 1);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(buf, 0755); *p = '/'; }
+    }
+    mkdir(buf, 0755);
+}
+
+int32_t jrt_load_jar_and_run(const void *jstr) {
+    char jar[4096];
+    jstr_to_cstr(jstr, jar, sizeof jar);
+    if (!jar[0]) return -1;
+
+    uint64_t h = fnv1a_file(jar);
+    if (h == 0) return -2; /* unreadable input */
+    h ^= (uint64_t)FJC_ABI_VERSION * 1099511628211ULL;
+
+    const char *cd = getenv("FASTJAVAC_CACHE");
+    char dir[4096];
+    if (cd && cd[0]) {
+        snprintf(dir, sizeof dir, "%s", cd);
+    } else {
+        const char *home = getenv("HOME");
+        snprintf(dir, sizeof dir, "%s/.cache/fastjavac", home ? home : "/tmp");
+    }
+    ensure_dir(dir);
+
+    char so[4200];
+    snprintf(so, sizeof so, "%s/fjc-%016llx.so", dir, (unsigned long long)h);
+
+    struct stat st;
+    if (stat(so, &st) != 0) {
+        /* Cache miss: compile the jar to a native module in a subprocess. */
+        const char *fjc = getenv("FASTJAVAC");
+        if (!fjc || !fjc[0]) fjc = "fastjavac";
+        char tmp[4300];
+        snprintf(tmp, sizeof tmp, "%s.tmp.%d", so, (int)getpid());
+        char cmd[16384];
+        snprintf(cmd, sizeof cmd, "'%s' --emit-module -o '%s' '%s'", fjc, tmp, jar);
+        int rc = system(cmd);
+        if (rc != 0) { remove(tmp); return -20; /* compilation failed */ }
+        if (rename(tmp, so) != 0) { remove(tmp); return -21; }
+    }
+    return load_so_and_run(so);
+}
 #else
 int32_t jrt_load_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
+int32_t jrt_load_jar_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 #endif
 
 int32_t jrt_instanceof(void *obj, void *target_td) {
