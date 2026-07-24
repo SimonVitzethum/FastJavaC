@@ -2606,6 +2606,77 @@ int32_t jrt_redefine(const void *target_j, const void *source_j, const void *sig
     return 0;
 }
 
+/* ---- Phase 5: binary trampoline patching (literal self-modifying code) --------
+ * Overwrite a function's patchable entry (reserved by -fpatchable-function-entry)
+ * with `movabs rax, newcode; jmp rax` so EVERY caller of that native symbol — not
+ * just virtual dispatch — is redirected to another already-native implementation.
+ * No code is generated; only 12 instruction bytes are rewritten. W^X-compliant
+ * (RW, write, RX — never writable+executable at once), which matters on hardened
+ * kernels. Single-threaded scope: patching a symbol whose code is running on
+ * another thread needs safepoints (deferred). x86-64 only. */
+#if defined(FASTLLVM_DYNAMIC) && !defined(FASTLLVM_FREESTANDING) && (defined(__x86_64__) || defined(_M_X64))
+#include <sys/mman.h>
+#include <fcntl.h>
+/* Overwrite 12 bytes at a function's patchable entry with `movabs rax,newcode; jmp
+ * rax`. Two strategies, tried in order, so it works across kernel policies:
+ *   1) mprotect the page to R|W|EXEC (keeping EXEC, so same-page code — the PLT and
+ *      our own return path — stays executable throughout), write, restore R|EXEC.
+ *   2) If RWX is refused (strict W^X), write via /proc/self/mem, which bypasses page
+ *      permissions for a self-write without ever making code writable+executable. */
+static int jrt_hotpatch(void *target, void *newcode) {
+    unsigned char patch[12];
+    patch[0] = 0x48; patch[1] = 0xB8;              /* movabs rax, imm64 */
+    uint64_t a = (uint64_t)(uintptr_t)newcode;
+    for (int i = 0; i < 8; i++) patch[2 + i] = (unsigned char)(a >> (8 * i));
+    patch[10] = 0xFF; patch[11] = 0xE0;            /* jmp rax */
+
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t page = (uintptr_t)target & ~(uintptr_t)(ps - 1);
+    uintptr_t endp = ((uintptr_t)target + sizeof patch + ps - 1) & ~(uintptr_t)(ps - 1);
+    size_t len = (size_t)(endp - page);
+
+    if (mprotect((void *)page, len, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        for (size_t i = 0; i < sizeof patch; i++) ((volatile unsigned char *)target)[i] = patch[i];
+        __builtin___clear_cache((char *)target, (char *)target + sizeof patch);
+        mprotect((void *)page, len, PROT_READ | PROT_EXEC); /* best-effort restore */
+        return 0;
+    }
+
+    int fd = open("/proc/self/mem", O_RDWR);
+    if (fd < 0) return -30;
+    ssize_t n = pwrite(fd, patch, sizeof patch, (off_t)(uintptr_t)target);
+    close(fd);
+    if (n != (ssize_t)sizeof patch) return -31;
+    __builtin___clear_cache((char *)target, (char *)target + sizeof patch);
+    return 0;
+}
+int32_t jrt_hotpatch_method(const void *target_j, const void *source_j, const void *sig_j) {
+    char target[256], source[256], sig[256];
+    jstr_to_cstr(target_j, target, sizeof target);
+    jstr_to_cstr(source_j, source, sizeof source);
+    jstr_to_cstr(sig_j, sig, sizeof sig);
+    if (!target[0] || !source[0] || !sig[0]) return -1;
+    char *sp = sig;
+    while (*sp && *sp != ' ') sp++;
+    if (*sp != ' ') return -1;
+    *sp = '\0';
+    const char *mname = sig, *mdesc = sp + 1;
+
+    const FjcClass *t = jrt_class_by_name(target);
+    const FjcMethod *tm = jrt_method(t, mname, mdesc);
+    if (!tm || !tm->code) return -2;
+    const FjcClass *s = jrt_class_by_name(source);
+    const FjcMethod *sm = jrt_method(s, mname, mdesc);
+    if (!sm || !sm->code) return -3;
+    return jrt_hotpatch((void *)tm->code, (void *)sm->code);
+}
+#else
+int32_t jrt_hotpatch_method(const void *t, const void *s, const void *g) {
+    (void)t; (void)s; (void)g; return -100; /* needs --dynamic on x86-64 */
+}
+#endif
+
 /* ---- M1: load a native module (.so) and run its entry point ----------------
  * dlopen the module (RTLD_LOCAL so its own symbols stay private; its undefined
  * jrt_* references resolve against this host, which is linked -rdynamic), verify

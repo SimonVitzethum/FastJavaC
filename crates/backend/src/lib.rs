@@ -2404,9 +2404,18 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     // code) per distinct DebugLine inline-stack, so instructions map to the exact
     // `.vr` line with the caller chain. `marker_locs` maps a marker's frames → its
     // innermost DILocation id.
+    // Phase 5: reserve 16 patchable NOP bytes at the entry of every user function in
+    // open-world / module builds, so jrt_hotpatch can overwrite them with a jmp
+    // (binary trampoline patching). Emitted as an LLVM function attribute so it
+    // survives LTO (the clang -fpatchable-function-entry flag does not reach .ll).
+    let patch_attr = if ctx.program.dynamic || ctx.program.module {
+        " \"patchable-function-entry\"=\"16\""
+    } else {
+        ""
+    };
     let (marker_locs, default_loc) = if dg.on {
         let sub = dg.subprogram(&f.name, f.line);
-        writeln!(w, "define {} @{}({}) !dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
+        writeln!(w, "define {} @{}({}){patch_attr} !dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
         let mut map: std::collections::HashMap<Vec<(String, u32)>, usize> = std::collections::HashMap::new();
         for bb in &f.blocks {
             for st in &bb.statements {
@@ -2421,7 +2430,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
         let def = dg.location(f.line, sub, 0);
         (map, Some(def))
     } else {
-        writeln!(w, "define {} @{}({}) {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
+        writeln!(w, "define {} @{}({}){patch_attr} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
         (std::collections::HashMap::new(), None)
     };
 

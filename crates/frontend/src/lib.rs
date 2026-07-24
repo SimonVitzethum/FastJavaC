@@ -2741,6 +2741,10 @@ fn lower_block(
                         // Phase 2: repoint target.<sig>'s vtable slot to the impl the
                         // (loaded) source class provides. sig = "name desc".
                         ("__fjc_redefine", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I") => ("jrt_redefine", 3),
+                        // Phase 5: redirect target.<sig>'s native entry to the source
+                        // class's impl by binary trampoline patching (affects all
+                        // callers of the symbol, not just virtual dispatch).
+                        ("__fjc_hotpatch", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I") => ("jrt_hotpatch_method", 3),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();

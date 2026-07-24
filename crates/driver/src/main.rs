@@ -266,6 +266,9 @@ fn main() {
         cmd.arg(&ll_path).arg(&shim_path);
         // Undefined jrt_* symbols are resolved at load against the host.
         cmd.args(["-ffunction-sections", "-fdata-sections"]);
+        // Phase 5: reserve 16 patchable bytes at each function entry so a module's
+        // methods can be redirected in place by jrt_hotpatch (trampoline patching).
+        cmd.arg("-fpatchable-function-entry=16");
         if threads {
             cmd.args(["-DFASTLLVM_THREADS", "-pthread"]);
         }
@@ -307,6 +310,9 @@ fn main() {
         // the host never calls itself) and exports jrt_* + libdl for dlopen.
         if dynamic {
             cmd.args(["-rdynamic", "-ldl", "-DFASTLLVM_DYNAMIC"]);
+            // Phase 5: patchable function entries so host methods can be redirected
+            // in place by jrt_hotpatch (binary trampoline patching).
+            cmd.arg("-fpatchable-function-entry=16");
         } else {
             cmd.arg("-Wl,--gc-sections");
         }
