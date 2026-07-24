@@ -2483,12 +2483,41 @@ static int jrt_cstreq(const char *a, const char *b) {
     return *a == *b;
 }
 
-/* Resolve a class descriptor by dotted name. Linear scan (table is small; a startup
- * hash index is a later optimization). NULL if not found. */
+/* Dynamic registry: FjcClass tables contributed by loaded modules (M1/M2). Kept
+ * as (table, len) segments; always compiled (empty in pure-AOT builds) so
+ * jrt_class_by_name can scan them without any libdl dependency. */
+typedef struct { const FjcClass *const *classes; uint32_t len; void *handle; } FjcModule;
+static FjcModule *fjc_modules = NULL;
+static uint32_t fjc_modules_len = 0, fjc_modules_cap = 0;
+
+static int fjc_register_dynamic(const FjcClass *const *classes, uint32_t len, void *handle) {
+    if (fjc_modules_len == fjc_modules_cap) {
+        uint32_t nc = fjc_modules_cap ? fjc_modules_cap * 2 : 4;
+        FjcModule *nm = (FjcModule *)plat_realloc(fjc_modules, nc * sizeof(FjcModule));
+        if (!nm) return 0;
+        fjc_modules = nm;
+        fjc_modules_cap = nc;
+    }
+    fjc_modules[fjc_modules_len].classes = classes;
+    fjc_modules[fjc_modules_len].len = len;
+    fjc_modules[fjc_modules_len].handle = handle;
+    fjc_modules_len++;
+    return 1;
+}
+
+/* Resolve a class descriptor by dotted name, scanning the static table and then
+ * every loaded module. Linear scan (a startup hash index is a later optimization).
+ * NULL if not found. */
 const FjcClass *jrt_class_by_name(const char *dotted) {
     for (uint32_t i = 0; i < fjc_classes_len; i++) {
         const FjcClass *c = fjc_classes[i];
         if (c && c->abi_version == FJC_ABI_VERSION && jrt_cstreq(c->name, dotted)) return c;
+    }
+    for (uint32_t m = 0; m < fjc_modules_len; m++) {
+        for (uint32_t i = 0; i < fjc_modules[m].len; i++) {
+            const FjcClass *c = fjc_modules[m].classes[i];
+            if (c && c->abi_version == FJC_ABI_VERSION && jrt_cstreq(c->name, dotted)) return c;
+        }
     }
     return NULL;
 }
@@ -2534,6 +2563,38 @@ int32_t jrt_fjc_instance_size(const void *jstr) {
     const FjcClass *c = fjc_by_jstr(jstr);
     return c ? (int32_t)c->instance_size : -1;
 }
+
+/* ---- M1: load a native module (.so) and run its entry point ----------------
+ * dlopen the module (RTLD_LOCAL so its own symbols stay private; its undefined
+ * jrt_* references resolve against this host, which is linked -rdynamic), verify
+ * the ABI, register its FjcClass table, then call fjc_module_main. Negative
+ * returns are loader errors; non-negative is the module's own return value.
+ * Requires --dynamic (libdl + exported host symbols). */
+#if defined(FASTLLVM_DYNAMIC) && !defined(FASTLLVM_FREESTANDING)
+#include <dlfcn.h>
+int32_t jrt_load_and_run(const void *jstr) {
+    const JStr *s = (const JStr *)jstr;
+    if (!s || s->len < 0 || s->len >= 4096) return -1;
+    char path[4096];
+    for (int64_t i = 0; i < s->len; i++) path[i] = (char)s->bytes[i];
+    path[s->len] = '\0';
+
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) return -10;
+    const uint32_t *abi = (const uint32_t *)dlsym(h, "fjc_module_abi");
+    if (!abi || *abi != FJC_ABI_VERSION) { dlclose(h); return -11; }
+    void (*init)(void *) = (void (*)(void *))dlsym(h, "fjc_module_init");
+    if (init) init(NULL);
+    const FjcClass *const *mc = (const FjcClass *const *)dlsym(h, "fjc_classes");
+    const uint32_t *mn = (const uint32_t *)dlsym(h, "fjc_classes_len");
+    if (mc && mn) fjc_register_dynamic(mc, *mn, h);
+    int32_t (*entry)(void) = (int32_t (*)(void))dlsym(h, "fjc_module_main");
+    if (!entry) { dlclose(h); return -12; }
+    return entry();
+}
+#else
+int32_t jrt_load_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
+#endif
 
 int32_t jrt_instanceof(void *obj, void *target_td) {
     if (!obj) return 0;

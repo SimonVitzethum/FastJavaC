@@ -18,6 +18,11 @@ fn main() {
     let mut no_solver = false;
     let mut freestanding = false;
     let mut threads = false;
+    // Phase 1 (M1): --emit-module compiles the input to a loadable native module
+    // (.so) instead of an executable; --dynamic builds a host binary able to load
+    // such modules at runtime (see DYNAMIC-RUNTIME-PLAN.md §5, PHASE-0-PLAN.md).
+    let mut emit_module = false;
+    let mut dynamic = false;
     let mut main_override: Option<String> = None;
     let mut raw_inputs: Vec<PathBuf> = Vec::new();
 
@@ -38,8 +43,12 @@ fn main() {
             "--no-solver" => no_solver = true,
             "--freestanding" => freestanding = true,
             "--threads" => threads = true,
+            "--emit-module" => emit_module = true,
+            "--dynamic" => dynamic = true,
             "-h" | "--help" => {
-                println!("Usage: fastjavac [-o BIN] [--main CLASS] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] (CLASS.class | LIB.jar) ...");
+                println!("Usage: fastjavac [-o BIN] [--main CLASS] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] [--emit-module] [--dynamic] (CLASS.class | LIB.jar) ...");
+                println!("  --emit-module  compile to a loadable native module (.so); entry class needs `static int fjcMain()`");
+                println!("  --dynamic      build a host binary that can load such modules at runtime");
                 return;
             }
             _ => raw_inputs.push(PathBuf::from(a)),
@@ -174,6 +183,64 @@ fn main() {
         return die(&format!("Schreiben nach {}: {e}", build_dir.display()));
     }
 
+    // --- Phase 1 (M1): native module output ---------------------------------
+    // A module is a shared object linked WITHOUT runtime.c: its jrt_* references
+    // stay undefined and resolve against the host at dlopen time (so host and
+    // module share ONE runtime/heap/collector). It exports:
+    //   fjc_module_abi   — the ABI version (host rejects a mismatch),
+    //   fjc_module_main  — a wrapper over the entry class's `static int fjcMain()`,
+    //   fjc_module_init  — reserved host-callback hook (no-op in v1),
+    //   fjc_classes[]/fjc_classes_len — the module's FjcClass registry (dlsym'd).
+    if emit_module {
+        let entry = match &program.main_class {
+            Some(c) => c.clone(),
+            None => return die("--emit-module requires an entry class (JAR Main-Class or --main) with `static int fjcMain()`"),
+        };
+        let has_entry = program
+            .class(&entry)
+            .map(|c| c.methods.iter().any(|m| m.name == "fjcMain" && m.desc == "()I" && m.is_static))
+            .unwrap_or(false);
+        if !has_entry {
+            return die(&format!("entry class {} has no `public static int fjcMain()`", entry.replace('/', ".")));
+        }
+        let sym = fastllvm_ir::mangle(&entry, "fjcMain", "()I");
+        let shim = format!(
+            "#include <stdint.h>\n\
+             extern int32_t {sym}(void);\n\
+             int32_t fjc_module_main(void) {{ return {sym}(); }}\n\
+             const uint32_t fjc_module_abi = {abi}u;\n\
+             void fjc_module_init(void *host) {{ (void)host; }}\n",
+            abi = fastllvm_ir::FJC_ABI_VERSION,
+        );
+        let shim_path = build_dir.join("module_shim.c");
+        if let Err(e) = std::fs::write(&shim_path, &shim) {
+            return die(&format!("Schreiben nach {}: {e}", build_dir.display()));
+        }
+        let mut cmd = Command::new("clang");
+        cmd.arg("-O2").arg("-shared").arg("-fPIC");
+        cmd.arg(&ll_path).arg(&shim_path);
+        // Undefined jrt_* symbols are resolved at load against the host.
+        cmd.args(["-ffunction-sections", "-fdata-sections"]);
+        if threads {
+            cmd.args(["-DFASTLLVM_THREADS", "-pthread"]);
+        }
+        let status = cmd.arg("-o").arg(&out).status();
+        match status {
+            Ok(s) if s.success() => {
+                let _ = std::fs::remove_dir_all(&build_dir);
+                return;
+            }
+            Ok(s) => return die(&format!("clang (module) schlug fehl ({s}); Zwischendateien in {}", build_dir.display())),
+            Err(e) => return die(&format!("clang not runnable: {e}")),
+        }
+    }
+
+    // --dynamic host: force the cycle collector on (open world → the acyclicity
+    // proof no longer holds once modules load), export jrt_* to loaded modules
+    // (-rdynamic), link libdl, and keep the full runtime (no --gc-sections, so a
+    // module can resolve helpers the host itself never calls).
+    let acyclic = acyclic && !dynamic;
+
     // Freestanding (seL4): no libc, no startup. The result is a relocatable
     // object (`clang -r`) that the target environment links together with its
     // own _start and the weak hooks (jrt_debug_putchar/jrt_platform_halt).
@@ -191,7 +258,13 @@ fn main() {
         cmd.arg("-flto");
     }
     if !freestanding {
-        cmd.arg("-Wl,--gc-sections");
+        // --dynamic keeps the whole runtime (a loaded module may resolve helpers
+        // the host never calls itself) and exports jrt_* + libdl for dlopen.
+        if dynamic {
+            cmd.args(["-rdynamic", "-ldl", "-DFASTLLVM_DYNAMIC"]);
+        } else {
+            cmd.arg("-Wl,--gc-sections");
+        }
         // Closed-world AOT on the target machine: compile for the native ISA
         // (AVX2/BMI etc.), as one builds optimized C++ with `-O3 -march=native`.
         // Vectorizes hot loops (arithmetic 2.4× faster than the SSE baseline

@@ -2733,6 +2733,10 @@ fn lower_block(
                         "__fjc_field_count" => "jrt_fjc_field_count",
                         "__fjc_method_count" => "jrt_fjc_method_count",
                         "__fjc_instance_size" => "jrt_fjc_instance_size",
+                        // M1: load a native module (.so) at the given path and run
+                        // its fjc_module_main; returns the module's result (or a
+                        // negative loader error code).
+                        "__fjc_load_and_run" => "jrt_load_and_run",
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}"))),
                     };
                     let arg = pop!();
