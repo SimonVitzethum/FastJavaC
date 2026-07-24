@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+# The Java → safe native binary compiler (`fastjavac`, in crates/driver) plus the
+# five libraries it depends on. Extracted from the FastLLVM/Vire monorepo; this is
+# the Java-AOT pipeline only (no Vire language, no GPU/Vulkan, no CSolver).
+default-members = ["crates/driver"]
+members = [
+    "crates/classfile", # .class / .jar parsing (constant pool, methods, attributes)
+    "crates/ir",        # shared mid-level SSA IR (the lowering target)
+    "crates/frontend",  # Java bytecode → IR (closed-world; devirt/inline seeds)
+    "crates/backend",   # IR → LLVM IR text (emission) + runtime linkage
+    "crates/solver",    # devirtualization / escape analysis / RC elision / bounds elision
+    "crates/driver",    # the `fastjavac` binary + the C runtime (runtime.c)
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+# Match the monorepo's release build (thin LTO across the crates + runtime.c).
+[profile.release]
+lto = "thin"
