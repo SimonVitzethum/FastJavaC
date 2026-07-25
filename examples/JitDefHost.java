@@ -30,7 +30,10 @@ public class JitDefHost {
         double d2 = __fjc_call_d("JitDefined", "twiceTrunc", "(D)D", 3.7);      // 6.0 (d2i+i2d)
         if (d1 != 6.0 || d2 != 6.0) throw new RuntimeException("double " + d1 + "," + d2);
 
-        if (n < 6 || sq != 49 || db != 4000000000L || notNull != 0 || isN != 1)
+        int caught = __fjc_call_obj1("JitDefined", "tryThrow", "(Ljava/lang/Object;)I", new RuntimeException());
+        if (caught != 42) throw new RuntimeException("exception dispatch " + caught); // athrow -> handler
+
+        if (n < 7 || sq != 49 || db != 4000000000L || notNull != 0 || isN != 1)
             throw new RuntimeException("jit-classloader " + n + "," + sq + "," + db + "," + notNull + "," + isN);
         System.out.println(sq);
         System.out.println(db);

@@ -7,4 +7,8 @@ public class JitDefined {
     static Object id(Object o) { return o; }                  // object return (RC +1)
     static double dsum(double x) { return x + x + 1.0; }       // double via xmm
     static double twiceTrunc(double x) { return (double) ((int) x * 2); } // d2i + i2d
+    static int tryThrow(Object e) {                            // athrow + handler dispatch
+        try { throw (RuntimeException) e; }
+        catch (RuntimeException x) { return 42; }
+    }
 }

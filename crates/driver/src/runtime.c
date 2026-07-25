@@ -2706,7 +2706,9 @@ static void je_jcc(unsigned char cc, int tpc) { je1(0x0F); je1(cc); JIT_FIX[JIT_
 static void je_jmp(int tpc) { je1(0xE9); JIT_FIX[JIT_NFIX].off = JIT_LEN; JIT_FIX[JIT_NFIX].target_pc = tpc; JIT_NFIX++; je_i32(0); }
 static int16_t je_s16(const uint8_t *b) { return (int16_t)((b[0] << 8) | b[1]); }
 
-static jit_fn jit_compile_bc(const uint8_t *bc, int n) {
+/* `exc` points at the method's exception_table entries (8 bytes each: start/end/handler/
+ * catch_type, big-endian), `nexc` the count; NULL/0 if none. Used to dispatch athrow. */
+static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc) {
     if (n <= 0 || n >= (1 << 16)) return NULL;
     JIT_LEN = 0; JIT_NFIX = 0;
     for (int i = 0; i <= n; i++) JIT_NOFF[i] = -1;
@@ -2783,6 +2785,18 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n) {
             case 0xaf: jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je1(0xC3); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
             case 0x87: je1(0x58); jeN("\xF2\x0F\x2A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* i2d: cvtsi2sd xmm0,eax; movq rax,xmm0; push */
             case 0x8e: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* d2i: movq xmm0,rax; cvttsd2si eax,xmm0; push */
+            /* --- exceptions --- */
+            case 0xbf: { /* athrow: jump to a covering handler (the exception is on the stack) */
+                int handler = -1;
+                for (int k = 0; k < nexc; k++) {
+                    const uint8_t *e = exc + k * 8;
+                    int s = (e[0] << 8) | e[1], en = (e[2] << 8) | e[3];
+                    if (pc >= s && pc < en) { handler = (e[4] << 8) | e[5]; break; }
+                }
+                if (handler < 0) return NULL; /* uncaught / cross-method propagation not yet JITted */
+                je_jmp(handler); pc++; break;
+            }
+            case 0xc0: pc += 3; break; /* checkcast: trusted no-op (leaves the ref) */
             default: return NULL; /* unsupported opcode */
         }
         if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
@@ -2808,7 +2822,9 @@ static int cf_utf8eq(const uint8_t *s, int len, const char *c) {
     for (int i = 0; i < len; i++) { if (!c[i] || s[i] != (uint8_t)c[i]) return 0; }
     return c[len] == '\0';
 }
-static const uint8_t *cf_find_code(const uint8_t *f, long flen, const char *mname, const char *mdesc, int *out_len) {
+static const uint8_t *cf_find_code(const uint8_t *f, long flen, const char *mname, const char *mdesc,
+                                   int *out_len, const uint8_t **out_exc, int *out_nexc) {
+    *out_exc = NULL; *out_nexc = 0;
     if (flen < 10 || cf_be32(f) != 0xCAFEBABEu) return NULL;
     uint16_t cpc = cf_be16(f + 8);
     const uint8_t **u = (const uint8_t **)calloc(cpc, sizeof(void *));
@@ -2838,7 +2854,10 @@ static const uint8_t *cf_find_code(const uint8_t *f, long flen, const char *mnam
         int match = ni < cpc && di < cpc && cf_utf8eq(u[ni], ul[ni], mname) && cf_utf8eq(u[di], ul[di], mdesc);
         for (int a = 0; a < ac; a++) {
             uint16_t an = cf_be16(p); uint32_t al = cf_be32(p + 2); const uint8_t *body = p + 6;
-            if (match && an < cpc && cf_utf8eq(u[an], ul[an], "Code")) { *out_len = (int)cf_be32(body + 4); code = body + 8; }
+            if (match && an < cpc && cf_utf8eq(u[an], ul[an], "Code")) {
+                int cl = (int)cf_be32(body + 4); *out_len = cl; code = body + 8;
+                const uint8_t *ex = code + cl; *out_nexc = cf_be16(ex); *out_exc = ex + 2;
+            }
             p += 6 + al;
         }
     }
@@ -2866,9 +2885,10 @@ int32_t jrt_jit_run(const void *path_j, const void *mname_j, const void *mdesc_j
     fclose(fp);
 
     int codelen = 0;
-    const uint8_t *code = cf_find_code(buf, flen, mname, mdesc, &codelen);
+    const uint8_t *jexc = NULL; int njexc = 0;
+    const uint8_t *code = cf_find_code(buf, flen, mname, mdesc, &codelen, &jexc, &njexc);
     if (!code || codelen <= 0) { free(buf); return -6; }
-    jit_fn fn = jit_compile_bc(code, codelen);
+    jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc);
     free(buf); /* bytecode already copied into the JITted page */
     if (!fn) return -7;
 
@@ -2917,7 +2937,7 @@ int32_t jrt_jit_raw(const void *bc_arr, int32_t arg) {
     if (!bc_arr) return -1;
     int64_t len = JARR_LEN(bc_arr);
     if (len <= 0 || len > (1 << 16)) return -2;
-    jit_fn fn = jit_compile_bc(JARR_DATA(bc_arr), (int)len);
+    jit_fn fn = jit_compile_bc(JARR_DATA(bc_arr), (int)len, NULL, 0);
     if (!fn) return -3;
     int64_t locals[64] = {0};
     locals[0] = arg;
@@ -2937,9 +2957,10 @@ int32_t jrt_define_and_run(const void *class_arr, const void *m_j, const void *d
     jstr_to_cstr(d_j, mdesc, sizeof mdesc);
     if (!mname[0] || !mdesc[0]) return -3;
     int codelen = 0;
-    const uint8_t *code = cf_find_code(JARR_DATA(class_arr), len, mname, mdesc, &codelen);
+    const uint8_t *jexc = NULL; int njexc = 0;
+    const uint8_t *code = cf_find_code(JARR_DATA(class_arr), len, mname, mdesc, &codelen, &jexc, &njexc);
     if (!code || codelen <= 0) return -6;
-    jit_fn fn = jit_compile_bc(code, codelen);
+    jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc);
     if (!fn) return -7;
     int64_t locals[64] = {0};
     locals[0] = arg;
@@ -2994,14 +3015,18 @@ static int cf_define_class(const uint8_t *f, long flen) {
         uint16_t di = cf_be16(p); p += 2;
         uint16_t ac = cf_be16(p); p += 2;
         const uint8_t *code = NULL; int codelen = 0;
+        const uint8_t *mexc = NULL; int nmexc = 0;
         for (int a = 0; a < ac; a++) {
             uint16_t an = cf_be16(p); uint32_t al = cf_be32(p + 2); const uint8_t *body = p + 6;
-            if (an < cpc && cf_utf8eq(u[an], ul[an], "Code")) { codelen = (int)cf_be32(body + 4); code = body + 8; }
+            if (an < cpc && cf_utf8eq(u[an], ul[an], "Code")) {
+                codelen = (int)cf_be32(body + 4); code = body + 8;
+                const uint8_t *ex = code + codelen; nmexc = cf_be16(ex); mexc = ex + 2;
+            }
             p += 6 + al;
         }
         if (ni >= cpc || di >= cpc) continue;
         void *codeptr = NULL;
-        if (code && codelen > 0) { jit_fn fn = jit_compile_bc(code, codelen); if (fn) { codeptr = (void *)fn; jitted++; } }
+        if (code && codelen > 0) { jit_fn fn = jit_compile_bc(code, codelen, mexc, nmexc); if (fn) { codeptr = (void *)fn; jitted++; } }
         methods[nm].name = util8dup(u[ni], ul[ni]);
         methods[nm].desc = util8dup(u[di], ul[di]);
         methods[nm].code = codeptr;
