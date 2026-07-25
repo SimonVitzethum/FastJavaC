@@ -720,6 +720,30 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
         )
         .unwrap();
     }
+    // Class objects referenced by `ldc X.class` for classes NOT in the closed
+    // world (the implicit root java.lang.Object being the common one). Emit a
+    // bare jclass (immortal header, name/simpleName) so the `@jclass.*` literal
+    // resolves; no struct/vtable is needed since only class identity is used.
+    {
+        let modelled: std::collections::HashSet<&str> =
+            program.classes.iter().map(|c| c.name.as_str()).collect();
+        for (name, _) in &program.class_objects {
+            if modelled.contains(name.as_str()) {
+                continue;
+            }
+            let dotted = name.replace('/', ".");
+            let simple = dotted.rsplit(['.', '$']).next().unwrap_or(&dotted).to_string();
+            let s = sanitize(name);
+            emit_jstr_const(w, &format!("jclassname.{s}"), dotted.as_bytes());
+            emit_jstr_const(w, &format!("jclasssimple.{s}"), simple.as_bytes());
+            writeln!(
+                w,
+                "@jclass.{s} = internal unnamed_addr constant {{ i64, ptr, ptr, ptr }} \
+                 {{ i64 -1, ptr null, ptr @jclassname.{s}, ptr @jclasssimple.{s} }}",
+            )
+            .unwrap();
+        }
+    }
     writeln!(w).unwrap();
 
     // Struct types: { i64 refcount(packed count+flags), ptr vtable, fields… }.

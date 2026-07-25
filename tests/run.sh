@@ -246,6 +246,7 @@ if sh "$root/tests/jitmod.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitnew.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/enumswitch.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/unsafe.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/varhandle.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 
 echo "---"
 echo "$pass passed, $fail failed"

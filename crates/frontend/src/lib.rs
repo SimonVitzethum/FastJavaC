@@ -863,47 +863,18 @@ fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) ->
     Origin::Opaque
 }
 
-/// Route a `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe` Object-relative
-/// int/long/reference memory-access method to its runtime helper + result type.
-/// Memory-order variants (Volatile/Acquire/Release/Opaque/Plain, `weak*`) all
-/// collapse to the seq_cst helper — conservative and correct on x86-64. The
-/// reference helpers carry the RC store barrier (retain new / release old).
-/// Address-based (non-Object) forms are excluded via the leading-ref check.
-fn unsafe_mem_route(name: &str, desc: &str) -> Option<(&'static str, Ty)> {
-    let (ptys, ret) = parse_descriptor(desc).ok()?;
-    if ptys.first() != Some(&Ty::Ref) {
-        return None; // only the (Object, long, …) family
-    }
-    // Width of the accessed value: return type for plain get*, else last param.
-    let val_ty = if name.starts_with("get") && !name.starts_with("getAnd") {
-        ret
-    } else {
-        ptys.last().copied().unwrap_or(Ty::Void)
-    };
+/// The `jrt_unsafe_*` helper for a (canonical op, value type). Shared by the
+/// `Unsafe` and `VarHandle` frontends — both bottom out in the same atomic memory
+/// layer (the ref helpers carry the RC store barrier). Canonical ops: get, put,
+/// cas, caex, getset, getadd.
+fn unsafe_helper(op: &str, val_ty: Ty) -> Option<&'static str> {
     let w = match val_ty {
         Ty::I64 => "long",
         Ty::Ref => "ref",
         Ty::I32 => "int",
         _ => return None,
     };
-    let vref = val_ty == Ty::Ref;
-    // getAndAdd is arithmetic → int/long only (no ref form).
-    let (op, rty) = if name.starts_with("compareAndExchange") {
-        ("caex", val_ty)
-    } else if name.starts_with("compareAndSet") || name.starts_with("weakCompareAndSet") {
-        ("cas", Ty::I32)
-    } else if name.starts_with("getAndAdd") && !vref {
-        ("getadd", val_ty)
-    } else if name.starts_with("getAndSet") {
-        ("getset", val_ty)
-    } else if name.starts_with("put") {
-        ("put", Ty::Void)
-    } else if name.starts_with("get") {
-        ("get", val_ty)
-    } else {
-        return None;
-    };
-    let func = match (op, w) {
+    Some(match (op, w) {
         ("get", "int") => "jrt_unsafe_get_int",
         ("put", "int") => "jrt_unsafe_put_int",
         ("cas", "int") => "jrt_unsafe_cas_int",
@@ -922,8 +893,119 @@ fn unsafe_mem_route(name: &str, desc: &str) -> Option<(&'static str, Ty)> {
         ("caex", "ref") => "jrt_unsafe_caex_ref",
         ("getset", "ref") => "jrt_unsafe_getset_ref",
         _ => return None,
+    })
+}
+
+/// Route a `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe` Object-relative
+/// int/long/reference memory-access method to its runtime helper + result type.
+/// Memory-order variants (Volatile/Acquire/Release/Opaque/Plain, `weak*`) all
+/// collapse to the seq_cst helper — conservative and correct on x86-64. The
+/// reference helpers carry the RC store barrier (retain new / release old).
+/// Address-based (non-Object) forms are excluded via the leading-ref check.
+fn unsafe_mem_route(name: &str, desc: &str) -> Option<(&'static str, Ty)> {
+    let (ptys, ret) = parse_descriptor(desc).ok()?;
+    if ptys.first() != Some(&Ty::Ref) {
+        return None; // only the (Object, long, …) family
+    }
+    // Width of the accessed value: return type for plain get*, else last param.
+    let val_ty = if name.starts_with("get") && !name.starts_with("getAnd") {
+        ret
+    } else {
+        ptys.last().copied().unwrap_or(Ty::Void)
     };
-    Some((func, rty))
+    let vref = val_ty == Ty::Ref;
+    let (op, rty) = if name.starts_with("compareAndExchange") {
+        ("caex", val_ty)
+    } else if name.starts_with("compareAndSet") || name.starts_with("weakCompareAndSet") {
+        ("cas", Ty::I32)
+    } else if name.starts_with("getAndAdd") && !vref {
+        ("getadd", val_ty)
+    } else if name.starts_with("getAndSet") {
+        ("getset", val_ty)
+    } else if name.starts_with("put") {
+        ("put", Ty::Void)
+    } else if name.starts_with("get") {
+        ("get", val_ty)
+    } else {
+        return None;
+    };
+    Some((unsafe_helper(op, val_ty)?, rty))
+}
+
+/// Route a signature-polymorphic `java.lang.invoke.VarHandle` access method to
+/// the same atomic memory layer. VarHandle spelling uses `set` (not `put`); the
+/// receiver object is the first descriptor parameter and the accessed value type
+/// gives the width. Memory-order suffixes collapse to seq_cst; `getAndBitwise*`
+/// is not modelled.
+fn varhandle_route(name: &str, desc: &str) -> Option<(&'static str, Ty)> {
+    let (ptys, ret) = parse_descriptor(desc).ok()?;
+    if ptys.first() != Some(&Ty::Ref) {
+        return None; // receiver object
+    }
+    let val_ty = if name.starts_with("get") && !name.starts_with("getAnd") {
+        ret
+    } else {
+        ptys.last().copied().unwrap_or(Ty::Void)
+    };
+    let vref = val_ty == Ty::Ref;
+    let (op, rty) = if name.starts_with("compareAndExchange") {
+        ("caex", val_ty)
+    } else if name.starts_with("compareAndSet") || name.starts_with("weakCompareAndSet") {
+        ("cas", Ty::I32)
+    } else if name.starts_with("getAndAdd") && !vref {
+        ("getadd", val_ty)
+    } else if name.starts_with("getAndSet") {
+        ("getset", val_ty)
+    } else if name.starts_with("set") {
+        ("put", Ty::Void)
+    } else if name.starts_with("get") {
+        ("get", val_ty)
+    } else {
+        return None;
+    };
+    Some((unsafe_helper(op, val_ty)?, rty))
+}
+
+/// Recover the instance-field name a `VarHandle` static field was bound to, by
+/// scanning the declaring class's `<clinit>` for the closed-world idiom
+/// `ldc "field"; ldc Class; (MhUtil|Lookup).findVarHandle; putstatic SF`. Lets
+/// the VarHandle op site fold the field offset. Bounded linear scan.
+fn varhandle_field_name(cf: &ClassFile, static_field: &str) -> Option<String> {
+    let clinit = cf.methods.iter().find(|m| m.name == "<clinit>")?;
+    let code = clinit.code.as_ref()?;
+    let instrs = fastllvm_classfile::decode_code(&code.bytecode, |_| None).ok()?;
+    let mut last_str: Option<String> = None;
+    let mut pending: Option<String> = None;
+    for (_, instr) in &instrs {
+        match instr {
+            Instr::LdcString(idx) => {
+                // `ldc Class` also decodes as LdcString here (the resolver only
+                // folds Integer constants); const_string fails on it, so keep the
+                // last real string — the field name precedes the `ldc Class` arg.
+                if let Ok(s) = cf.const_string(*idx) {
+                    last_str = Some(s.to_string());
+                }
+            }
+            Instr::InvokeStatic(idx) | Instr::InvokeVirtual(idx) => {
+                if let Ok((_, n, _)) = cf.member_ref(*idx) {
+                    if n == "findVarHandle" {
+                        pending = last_str.clone();
+                    }
+                }
+            }
+            Instr::PutStatic(idx) => {
+                if let Ok((_, n, _)) = cf.member_ref(*idx) {
+                    if n == static_field {
+                        if let Some(f) = pending.take() {
+                            return Some(f);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 struct MethodLowering<'a> {
@@ -938,6 +1020,11 @@ struct MethodLowering<'a> {
     /// Class object statically even across blocks (the origin analysis is
     /// only block-local, since invokestatic splits).
     class_const: HashMap<Local, String>,
+    /// Local → (owner class, static field) it was loaded from, for statics of
+    /// type `java.lang.invoke.VarHandle`. Lets a VarHandle op site recover the
+    /// bound instance field (via the declaring class's `<clinit>`) and fold the
+    /// field offset — the closed-world lowering of VarHandle-based atomics.
+    vh_static: HashMap<Local, (String, String)>,
 }
 
 impl<'a> MethodLowering<'a> {
@@ -1131,6 +1218,7 @@ fn lower_method(
         slot_map: HashMap::new(),
         stack_map: HashMap::new(),
         class_const: HashMap::new(),
+        vh_static: HashMap::new(),
     };
 
     // Parameters occupy the first IR locals; JVM slot counting accounts for
@@ -1343,7 +1431,11 @@ fn lower_block(
                     // ldc of a class constant (`Widget.class`).
                     Some(Const::Class { .. }) => {
                         let class = ml.cf.class_name(*idx)?.to_string();
-                        if program.class(&class).is_none() {
+                        // `java.lang.Object` is the implicit root — modelled but not a
+                        // registered ClassInfo — yet `Object.class` literals are common
+                        // (e.g. the findVarHandle type arg). The backend emits a jclass
+                        // for it via the class_objects set.
+                        if class != "java/lang/Object" && program.class(&class).is_none() {
                             return Err(FrontendError::Unsupported(format!(
                                 "{class}.class (class not in the closed-world input)"
                             )));
@@ -1907,17 +1999,21 @@ fn lower_block(
                 throw_after = Some(*pc);
             }
             Instr::GetStatic(idx) => {
-                let (class, name, _) = ml.cf.member_ref(*idx)?;
+                let (class, name, fdesc) = ml.cf.member_ref(*idx)?;
                 if class == "java/lang/System" && (name == "out" || name == "err") {
                     // Receiver dummy; the println intrinsic ignores it.
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                 } else {
+                    let is_vh = fdesc == "Ljava/lang/invoke/VarHandle;";
                     let (class, field) = (class.to_string(), name.to_string());
                     let (_, ty) = program.resolve_static_field(&class, &field).ok_or_else(|| {
                         FrontendError::Unsupported(format!("getstatic {class}.{field}"))
                     })?;
                     let l = ml.stack_slot(stack.len(), ty);
-                    stmts.push(Statement::GetStatic { dest: l, class, field });
+                    stmts.push(Statement::GetStatic { dest: l, class: class.clone(), field: field.clone() });
+                    if is_vh {
+                        ml.vh_static.insert(l, (class, field));
+                    }
                     stack.push(ty);
                 }
             }
@@ -2021,6 +2117,78 @@ fn lower_block(
                     return Err(FrontendError::Unsupported(format!(
                         "Unsafe.{uname}{udesc} (supported: objectFieldOffset(Class,String); \
                          int/long get/put/compareAndSet/compareAndExchange/getAndAdd/getAndSet)"
+                    )));
+                }
+                // Lookup.findVarHandle (instance form) → placeholder null, like the
+                // static helpers (the field is resolved at the op site below).
+                if class == "java/lang/invoke/MethodHandles$Lookup" && name == "findVarHandle" {
+                    let (ptys, _) = parse_descriptor(desc)?;
+                    for _ in &ptys {
+                        pop!();
+                    }
+                    pop!(); // Lookup receiver
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
+                    continue;
+                }
+                // --- java.lang.invoke.VarHandle op site: lower to the atomic layer ---
+                // The receiver traces to a findVarHandle static field; its bound
+                // instance field (recovered from <clinit>) + the receiver-object class
+                // (the op's first parameter) give the byte offset. Signature-poly ops
+                // route through varhandle_route to the same jrt_unsafe_* helpers.
+                if class == "java/lang/invoke/VarHandle" {
+                    let (uname, udesc) = (name.to_string(), desc.to_string());
+                    if let Some((func, rty)) = varhandle_route(&uname, &udesc) {
+                        let (ptys, _) = parse_descriptor(&udesc)?;
+                        let mut params = Vec::new();
+                        for _ in &ptys {
+                            params.push(pop!());
+                        }
+                        params.reverse(); // [object, val1, val2, …]
+                        let vh = pop!(); // the VarHandle receiver
+                        let (owner, sf) = ml.vh_static.get(&vh).cloned().ok_or_else(|| {
+                            FrontendError::Unsupported(
+                                "VarHandle op on an opaque VarHandle (closed world: must come \
+                                 from a findVarHandle static field)"
+                                    .into(),
+                            )
+                        })?;
+                        if owner != ml.cf.this_class {
+                            return Err(FrontendError::Unsupported(format!(
+                                "VarHandle static {owner}.{sf} declared in another class"
+                            )));
+                        }
+                        let fname = varhandle_field_name(ml.cf, &sf).ok_or_else(|| {
+                            FrontendError::Unsupported(format!(
+                                "VarHandle field for {owner}.{sf} (findVarHandle idiom not recognized)"
+                            ))
+                        })?;
+                        // Receiver-object class = the op descriptor's first parameter.
+                        let recv_class = descriptor_params(&udesc)?
+                            .first()
+                            .and_then(|p| p.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string()))
+                            .ok_or_else(|| FrontendError::Unsupported("VarHandle receiver type".into()))?;
+                        let (off, _) = program.field_byte_offset(&recv_class, &fname).ok_or_else(|| {
+                            FrontendError::Unsupported(format!(
+                                "VarHandle offset: unknown field {recv_class}.{fname}"
+                            ))
+                        })?;
+                        let mut args = vec![Operand::Copy(params[0]), Operand::ConstI64(off as i64)];
+                        for p in &params[1..] {
+                            args.push(Operand::Copy(*p));
+                        }
+                        let dest = if rty == Ty::Void {
+                            None
+                        } else {
+                            let l = ml.stack_slot(stack.len(), rty);
+                            stack.push(rty);
+                            Some(l)
+                        };
+                        stmts.push(Statement::Call { dest, func: func.to_string(), args });
+                        continue;
+                    }
+                    return Err(FrontendError::Unsupported(format!(
+                        "VarHandle.{uname}{udesc} (supported: get/set/compareAndSet/\
+                         compareAndExchange/getAndSet/getAndAdd + memory-order variants)"
                     )));
                 }
                 // System.out.printf(fmt, Object[]) → format + print,
@@ -2790,6 +2958,24 @@ fn lower_block(
                 if (class == "jdk/internal/misc/Unsafe" || class == "sun/misc/Unsafe")
                     && name == "getUnsafe"
                 {
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
+                    continue;
+                }
+                // VarHandle plumbing (closed world): MethodHandles.lookup() and the
+                // static findVarHandle helpers produce placeholder nulls — the actual
+                // field is resolved at the VarHandle op site (see invokevirtual). This
+                // keeps the java.lang.invoke machinery out of the compiled world.
+                if class == "java/lang/invoke/MethodHandles" && name == "lookup" {
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
+                    continue;
+                }
+                if name == "findVarHandle"
+                    && desc.ends_with(")Ljava/lang/invoke/VarHandle;")
+                {
+                    let (ptys, _) = parse_descriptor(desc)?;
+                    for _ in &ptys {
+                        pop!();
+                    }
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                     continue;
                 }
