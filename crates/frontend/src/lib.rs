@@ -2792,6 +2792,8 @@ fn lower_block(
                         ("__fjc_define_class", "([B)I") => ("jrt_define_class_jit", 1),
                         ("__fjc_call", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J") => ("jrt_call_static", 4),
                         ("__fjc_call_obj1", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)I") => ("jrt_call_static_obj1", 4),
+                        // Object-returning call (retains the result per the +1 ref contract):
+                        ("__fjc_call_ref", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;") => ("jrt_call_static_ref", 4),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();

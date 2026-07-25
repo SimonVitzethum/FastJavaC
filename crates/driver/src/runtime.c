@@ -3042,6 +3042,22 @@ int32_t jrt_call_static_obj1(const void *cls_j, const void *m_j, const void *d_j
     int64_t locals[64] = {0}; locals[0] = (int64_t)(uintptr_t)obj;
     return (int32_t)((jit_fn)mm->code)(locals);
 }
+
+/* Object-returning invoker (point 4): pass a reference arg, return the referenced result
+ * — RETAINED, since a Java reference return transfers +1 to the caller (the host's RC then
+ * balances the extra reference). Without this barrier the host would over-release a
+ * borrowed object the method returned (e.g. its argument or a field). For methods that
+ * return a freshly-created object (once `new` is JITted) the same +1 contract holds. */
+void *jrt_call_static_ref(const void *cls_j, const void *m_j, const void *d_j, const void *obj) {
+    char cls[256], m[256], d[256];
+    jstr_to_cstr(cls_j, cls, sizeof cls); jstr_to_cstr(m_j, m, sizeof m); jstr_to_cstr(d_j, d, sizeof d);
+    const FjcMethod *mm = jrt_method(jrt_class_by_name(cls), m, d);
+    if (!mm || !mm->code) return NULL;
+    int64_t locals[64] = {0}; locals[0] = (int64_t)(uintptr_t)obj;
+    void *res = (void *)(uintptr_t)((jit_fn)mm->code)(locals);
+    if (res) jrt_retain(res); /* +1 transfer to the host */
+    return res;
+}
 #else
 int32_t jrt_jit_run(const void *a, const void *b, const void *c, int32_t d) {
     (void)a; (void)b; (void)c; (void)d; return -100; /* needs --dynamic on x86-64 */
@@ -3055,6 +3071,7 @@ int32_t jrt_read_into(const void *a, const void *b) { (void)a; (void)b; return -
 int32_t jrt_define_class_jit(const void *a) { (void)a; return -100; }
 int64_t jrt_call_static(const void *a, const void *b, const void *c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -100; }
 int32_t jrt_call_static_obj1(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return -100; }
+void *jrt_call_static_ref(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return (void *)0; }
 #endif
 
 /* ---- M1: load a native module (.so) and run its entry point ----------------
