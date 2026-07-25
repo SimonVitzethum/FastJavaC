@@ -3899,6 +3899,62 @@ void *jrt_call_new(const void *a, const void *b, const void *c) { (void)a; (void
 #include <sys/types.h>
 #include <unistd.h>
 
+/* ---- JNI bridge: call the JDK's own compiled native leaves (NATIVE-STRATEGY.md) ----
+ * A socket/file/etc. leaf we hand-write; but the long tail (zip, charsets, crypto) is
+ * already implemented in the JDK's libzip/libnio/... We reach it by: dlopen the real
+ * libjvm.so (RTLD_GLOBAL, no VM started — just its JVM_* symbols so the leaf lib's
+ * NEEDED chain resolves), dlopen the leaf lib, and call Java_<class>_<method> with a
+ * minimal JNIEnv over fastjavac's object model. The JNI function table is a fixed-order
+ * array of fn pointers (JNINativeInterface_): the slots we fill are the ones the target
+ * leaf calls. Paths from FJC_LIBJVM/FJC_LIBZIP or $JAVA_HOME. */
+static void *jni_bridge_get_critical(void *env, void *arr, void *isCopy) {
+    (void)env; if (isCopy) *(int8_t *)isCopy = 0;
+    return (char *)arr + 32;                 /* fastjavac array data begins at +32 */
+}
+static void jni_bridge_release_critical(void *env, void *arr, void *carr, int32_t mode) {
+    (void)env; (void)arr; (void)carr; (void)mode;
+}
+static int32_t jni_bridge_arraylen(void *env, void *arr) {
+    (void)env; return (int32_t)(*(int64_t *)((char *)arr + 16));   /* length @ +16 */
+}
+static void *jni_table[236];                 /* JNINativeInterface_ slot count */
+static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
+static int jni_ready;                        /* 0 unknown, 1 ok, -1 unavailable */
+static int32_t (*crc32_updatebytes)(void *, void *, int32_t, void *, int32_t, int32_t);
+
+static int jrt_jni_ensure(void) {
+    if (jni_ready) return jni_ready > 0;
+    jni_ready = -1;
+    char jvmbuf[4096], zipbuf[4096];
+    const char *libjvm = getenv("FJC_LIBJVM");
+    const char *libzip = getenv("FJC_LIBZIP");
+    const char *jh = getenv("JAVA_HOME");
+    if ((!libjvm || !libzip) && jh) {         /* derive from $JAVA_HOME if not given */
+        if (!libjvm) { snprintf(jvmbuf, sizeof jvmbuf, "%s/lib/server/libjvm.so", jh); libjvm = jvmbuf; }
+        if (!libzip) { snprintf(zipbuf, sizeof zipbuf, "%s/lib/libzip.so", jh); libzip = zipbuf; }
+    }
+    if (!libjvm || !libzip) return 0;
+    if (!dlopen(libjvm, RTLD_NOW | RTLD_GLOBAL)) return 0;   /* provide JVM_* globally */
+    void *z = dlopen(libzip, RTLD_NOW | RTLD_LOCAL);
+    if (!z) return 0;
+    crc32_updatebytes = (int32_t (*)(void *, void *, int32_t, void *, int32_t, int32_t))
+                        dlsym(z, "Java_java_util_zip_CRC32_updateBytes0");
+    if (!crc32_updatebytes) return 0;
+    jni_table[171] = (void *)jni_bridge_arraylen;
+    jni_table[222] = (void *)jni_bridge_get_critical;
+    jni_table[223] = (void *)jni_bridge_release_critical;
+    jni_table_ptr = jni_table;
+    jni_ready = 1;
+    return 1;
+}
+
+/* CRC32.updateBytes0(crc, byte[], off, len) via the JDK's real libzip leaf. Returns
+ * the updated running crc; -1 if the bridge is unavailable (no JDK libs found). */
+int32_t jrt_jni_crc32(int32_t crc, void *arr, int32_t off, int32_t len) {
+    if (!arr || !jrt_jni_ensure()) return -1;
+    return crc32_updatebytes(&jni_table_ptr, NULL, crc, arr, off, len);
+}
+
 /* Load an already-built native module (.so) by path, verify its ABI, register its
  * classes, and run fjc_module_main. Shared by the M1 and M2 entry points. */
 static int32_t load_so_and_run(const char *path) {
@@ -3992,6 +4048,7 @@ int32_t jrt_load_jar_and_run(const void *jstr) {
 }
 #else
 int32_t jrt_load_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
+int32_t jrt_jni_crc32(int32_t a, void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -1; }
 int32_t jrt_load_jar_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 #endif
 
