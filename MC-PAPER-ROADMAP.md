@@ -210,12 +210,23 @@ built to the reachable set, not the whole JDK.
       (native) callees. Combined with (1), the mod-critical chain works end to end: a JITted
       method `new`s an object, its AOT constructor sets a field via the correct `this`, a
       virtual getter reads it, and the object is RC-freed — heap balances.
-   Remaining (narrower): float/double call args (xmm register classes), >6 args (stack),
-   and the *reverse* AOT→JIT direction — a JIT-defined override installed in an AOT vtable
-   slot, called by AOT code — which needs JIT methods to also have native-arg entry
-   prologues (the last step for fully JIT-defined polymorphic subclasses). Also: array
-   creation/access, and full exception semantics (uncaught propagation, per-pc stack-depth
-   reset, type-narrowed catches).
+   **Arrays — DONE** (`tests/jitarr.sh`): int/reference array creation (newarray/anewarray),
+   element load/store (iaload/iastore/aaload/aastore via bounds-checking runtime helpers),
+   and arraylength; new arrays are RC-owned and freed. `@main` publishes the array vtables
+   to runtime globals so JITted code can allocate.
+   **Float/double call args + results — DONE** (`tests/jitfloat.sh`): the JIT↔AOT native
+   marshaller is descriptor-driven (int/ref/long→RDI..R9, float/double→XMM0..7), results are
+   read from RAX or XMM0 by return type, and RC release is wired into dreturn/freturn.
+   **Remaining — the reverse AOT→JIT direction only:** a JIT-defined override installed in
+   an AOT vtable slot and called *by AOT code* still can't consume its native args, because
+   JITted methods use a locals-array entry (fed by the invokers), not a native-arg prologue.
+   The fix is a coherent but fundamental change: give JIT methods a native entry (allocate a
+   stack locals frame, spill the arg registers into it per the descriptor + max_locals),
+   make the invokers call JIT methods with native args, and unify the invoke path to always
+   native-marshal — after which JIT and AOT are ABI-identical and fully JIT-defined
+   polymorphic subclasses work. Also minor: >6-arg calls (stack args; currently such methods
+   are simply not JITted) and full exception semantics (uncaught propagation across methods,
+   per-pc stack-depth reset for deep throws, type-narrowed catches).
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
