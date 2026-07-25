@@ -11,4 +11,5 @@ public class JitDefined {
         try { throw (RuntimeException) e; }
         catch (RuntimeException x) { return 42; }
     }
+    static int fact(int n) { return n <= 1 ? 1 : n * fact(n - 1); } // invokestatic (self-recursion)
 }

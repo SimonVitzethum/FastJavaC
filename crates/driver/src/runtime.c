@@ -2749,6 +2749,42 @@ static int jit_resolve_field(const CpInfo *cp, int fref, int *out_off, int *out_
 
 /* `exc` points at the method's exception_table entries (8 bytes each: start/end/handler/
  * catch_type, big-endian), `nexc` the count; NULL/0 if none. Used to dispatch athrow. */
+/* Resolve a Methodref cp index to the registered FjcMethod (whose `code` field holds the
+ * native entry, filled once every method of its class is JITted). Also outputs the
+ * descriptor (for arg counting). Returns the FjcMethod* or NULL. */
+static const FjcMethod *jit_resolve_method(const CpInfo *cp, int mref, char *desc_out, int desc_cap) {
+    if (!cp || mref <= 0 || mref >= cp->cpc) return NULL;
+    int ci = cp->ref_class[mref], ni = cp->ref_nat[mref];
+    if (ci <= 0 || ci >= cp->cpc || ni <= 0 || ni >= cp->cpc) return NULL;
+    int cni = cp->cls_ni[ci], mni = cp->nat_name[ni], mdi = cp->nat_desc[ni];
+    if (cni <= 0 || cni >= cp->cpc || mni <= 0 || mni >= cp->cpc || mdi <= 0 || mdi >= cp->cpc) return NULL;
+    char dotted[256], mname[256];
+    int cl = cp->ul[cni], nl = cp->ul[mni], dl = cp->ul[mdi];
+    if (cl >= 256 || nl >= 256 || dl >= desc_cap) return NULL;
+    for (int i = 0; i < cl; i++) { char c = (char)cp->u[cni][i]; dotted[i] = c == '/' ? '.' : c; }
+    dotted[cl] = '\0';
+    memcpy(mname, cp->u[mni], nl); mname[nl] = '\0';
+    memcpy(desc_out, cp->u[mdi], dl); desc_out[dl] = '\0';
+    return jrt_method(jrt_class_by_name(dotted), mname, desc_out);
+}
+
+/* Count arguments in a method descriptor (one slot each in the JIT's model, incl.
+ * long/double); sets *is_void from the return type. */
+static int jit_arg_count(const char *desc, int *is_void) {
+    const char *p = desc;
+    if (*p != '(') return -1;
+    p++;
+    int k = 0;
+    while (*p && *p != ')') {
+        if (*p == 'L') { while (*p && *p != ';') p++; if (*p == ';') p++; k++; }
+        else if (*p == '[') { p++; }
+        else { p++; k++; }
+    }
+    if (*p == ')') p++;
+    *is_void = (*p == 'V');
+    return k;
+}
+
 static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc, const CpInfo *cp) {
     if (n <= 0 || n >= (1 << 16)) return NULL;
     JIT_LEN = 0; JIT_NFIX = 0;
@@ -2854,6 +2890,33 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 je1(0x58); je1(0x59); /* pop rax (value); pop rcx (objref) */
                 if (wide) { jeN("\x48\x89\x81", 3); je_i32(off); } /* mov [rcx+off], rax */
                 else { jeN("\x89\x81", 2); je_i32(off); }         /* mov [rcx+off], eax */
+                pc += 3; break;
+            }
+            /* --- invokestatic: call another registered method (JIT-defined or AOT) --- */
+            case 0xb8: {
+                char mdesc[256];
+                const FjcMethod *m = jit_resolve_method(cp, (bc[pc + 1] << 8) | bc[pc + 2], mdesc, sizeof mdesc);
+                if (!m) return NULL;
+                int voidret = 0, K = jit_arg_count(mdesc, &voidret);
+                if (K < 0 || K > 60) return NULL;
+                /* Callee frame (528 B): [rsp]=saved our-RDI, [rsp+8..)=callee locals (64 slots).
+                 * Copy the K operand-stack args (arg0 deepest) into locals[0..K-1], set RDI to
+                 * the callee locals, indirect-call through &FjcMethod.code (filled at run time,
+                 * so forward/self references work), then restore, pop args, push the result. */
+                je1(0x48); je1(0x81); je1(0xEC); je_i32(528);      /* sub rsp,528 */
+                jeN("\x48\x89\x3C\x24", 4);                        /* mov [rsp], rdi */
+                for (int i = 0; i < K; i++) {
+                    jeN("\x48\x8B\x84\x24", 4); je_i32(528 + 8 * (K - 1 - i)); /* mov rax,[rsp+..] */
+                    jeN("\x48\x89\x84\x24", 4); je_i32(8 + 8 * i);            /* mov [rsp+..],rax */
+                }
+                jeN("\x48\x8D\x7C\x24\x08", 5);                    /* lea rdi,[rsp+8] */
+                je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)m); /* mov rax, &FjcMethod */
+                jeN("\x48\x8B\x40\x10", 4);                        /* mov rax,[rax+16] (code) */
+                jeN("\xFF\xD0", 2);                                /* call rax */
+                jeN("\x48\x8B\x3C\x24", 4);                        /* mov rdi,[rsp] (restore) */
+                je1(0x48); je1(0x81); je1(0xC4); je_i32(528);      /* add rsp,528 */
+                if (K > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * K); } /* add rsp,8K (pop args) */
+                if (!voidret) je1(0x50);                           /* push rax (result) */
                 pc += 3; break;
             }
             default: return NULL; /* unsupported opcode */
@@ -3073,9 +3136,28 @@ static int cf_define_class(const uint8_t *f, long flen) {
     for (int i = 0; i < fc; i++) { p += 6; uint16_t ac = cf_be16(p); p += 2; for (int a = 0; a < ac; a++) { uint32_t al = cf_be32(p + 2); p += 6 + al; } }
     uint16_t mc = cf_be16(p); p += 2;              /* methods */
 
+    /* Class name first, so the class can be registered BEFORE any body is JITted —
+     * that is what lets invokestatic resolve self/forward references. */
+    char *name = NULL;                             /* this_class -> Class -> Utf8, dotted */
+    if (this_class < cpc && cls_ni[this_class] && cls_ni[this_class] < cpc) {
+        uint16_t nidx = cls_ni[this_class];
+        name = util8dup(u[nidx], ul[nidx]);
+        if (name) for (char *q = name; *q; q++) if (*q == '/') *q = '.';
+    }
     FjcMethod *methods = (FjcMethod *)calloc(mc ? mc : 1, sizeof(FjcMethod));
-    if (!methods) { CF_FREE_CP(); return -4; }
-    int nm = 0, jitted = 0;
+    const uint8_t **mcode = (const uint8_t **)calloc(mc ? mc : 1, sizeof(void *));
+    int *mclen = (int *)calloc(mc ? mc : 1, sizeof(int));
+    const uint8_t **mexcp = (const uint8_t **)calloc(mc ? mc : 1, sizeof(void *));
+    int *mexcn = (int *)calloc(mc ? mc : 1, sizeof(int));
+    FjcClass *c = (FjcClass *)calloc(1, sizeof(FjcClass));
+    const FjcClass **arr = (const FjcClass **)calloc(1, sizeof(void *));
+    if (!methods || !mcode || !mclen || !mexcp || !mexcn || !c || !arr || !name) {
+        CF_FREE_CP(); free(methods); free(mcode); free(mclen); free(mexcp); free(mexcn); free(c); free(arr); free(name);
+        return -4;
+    }
+
+    /* Pass 1: record each method's name/desc/flags and locate its bytecode. */
+    int nm = 0;
     for (int i = 0; i < mc; i++) {
         uint16_t maf = cf_be16(p); p += 2;
         uint16_t ni = cf_be16(p); p += 2;
@@ -3092,32 +3174,35 @@ static int cf_define_class(const uint8_t *f, long flen) {
             p += 6 + al;
         }
         if (ni >= cpc || di >= cpc) continue;
-        void *codeptr = NULL;
-        if (code && codelen > 0) { jit_fn fn = jit_compile_bc(code, codelen, mexc, nmexc, &cpinfo); if (fn) { codeptr = (void *)fn; jitted++; } }
         methods[nm].name = util8dup(u[ni], ul[ni]);
         methods[nm].desc = util8dup(u[di], ul[di]);
-        methods[nm].code = codeptr;
+        methods[nm].code = NULL;
         methods[nm].vtable_index = -1;
         methods[nm].flags = (maf & 0x0008) ? 1u : 0u; /* ACC_STATIC */
+        mcode[nm] = code; mclen[nm] = codelen; mexcp[nm] = mexc; mexcn[nm] = nmexc;
         nm++;
     }
 
-    char *name = NULL;                             /* this_class -> Class -> Utf8, dotted */
-    if (this_class < cpc && cls_ni[this_class] && cls_ni[this_class] < cpc) {
-        uint16_t nidx = cls_ni[this_class];
-        name = util8dup(u[nidx], ul[nidx]);
-        if (name) for (char *q = name; *q; q++) if (*q == '/') *q = '.';
-    }
-    FjcClass *c = (FjcClass *)calloc(1, sizeof(FjcClass));
-    const FjcClass **arr = (const FjcClass **)calloc(1, sizeof(void *));
-    CF_FREE_CP();
-    if (!c || !arr || !name) { free(c); free(arr); free(name); free(methods); return -5; }
+    /* Register the class NOW (code pointers still NULL) so JIT-time method resolution
+     * (jrt_class_by_name/jrt_method -> &methods[j]) works for same-class calls. */
     c->abi_version = FJC_ABI_VERSION;
     c->name = name;
     c->n_methods = (uint32_t)nm;
     c->methods = methods;
     arr[0] = c;
     fjc_register_dynamic((const FjcClass *const *)arr, 1, NULL);
+
+    /* Pass 2: JIT each body. invokestatic emits an indirect call through &methods[j].code,
+     * which is filled here — so forward and self references resolve correctly. */
+    int jitted = 0;
+    for (int j = 0; j < nm; j++) {
+        if (mcode[j] && mclen[j] > 0) {
+            jit_fn fn = jit_compile_bc(mcode[j], mclen[j], mexcp[j], mexcn[j], &cpinfo);
+            if (fn) { methods[j].code = (void *)fn; jitted++; }
+        }
+    }
+    CF_FREE_CP();
+    free(mcode); free(mclen); free(mexcp); free(mexcn);
     return jitted;
 }
 

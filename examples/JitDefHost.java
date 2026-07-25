@@ -33,7 +33,10 @@ public class JitDefHost {
         int caught = __fjc_call_obj1("JitDefined", "tryThrow", "(Ljava/lang/Object;)I", new RuntimeException());
         if (caught != 42) throw new RuntimeException("exception dispatch " + caught); // athrow -> handler
 
-        if (n < 7 || sq != 49 || db != 4000000000L || notNull != 0 || isN != 1)
+        long f = __fjc_call("JitDefined", "fact", "(I)I", 5);                    // 120 (invokestatic recursion)
+        if (f != 120) throw new RuntimeException("invokestatic " + f);
+
+        if (n < 8 || sq != 49 || db != 4000000000L || notNull != 0 || isN != 1)
             throw new RuntimeException("jit-classloader " + n + "," + sq + "," + db + "," + notNull + "," + isN);
         System.out.println(sq);
         System.out.println(db);
