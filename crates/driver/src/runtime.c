@@ -4375,8 +4375,15 @@ void jrt_jni_arg_p(void *v)   { if (jni_argn < 64) { jni_argbuf[jni_argn] = (int
 /* Resolve the JNI symbol (short, then overloaded __<sig>) and libffi-call it with a
  * (JNIEnv*, jclass|jobject, args…) prologue. Returns the result as int64 bits; the
  * typed wrappers below reinterpret. Clears the arg buffer. */
-static int64_t jni_invoke_core(const void *sym_j, const void *argdesc_j, int32_t ret, int32_t is_static, void *recv) {
+static int64_t jni_invoke_core(const void *sym_j, const void *argdesc_j, const void *cls_j, int32_t ret, int32_t is_static, void *recv) {
     int n = jni_argn; jni_argn = 0;
+    /* static native: pass the declaring class as the jclass (so the native's jclass
+     * arg is usable — GetStaticFieldID/FindClass/etc). Instance: recv is the jobject. */
+    if (is_static && cls_j) {
+        char cn[512]; jstr_to_cstr(cls_j, cn, sizeof cn);
+        for (int i = 0; cn[i]; i++) if (cn[i] == '/') cn[i] = '.';
+        recv = (void *)jrt_class_by_name(cn);
+    }
     jni_env_setup();
     char sym[512], argd[256];
     jstr_to_cstr(sym_j, sym, sizeof sym);
@@ -4435,12 +4442,12 @@ static int64_t jni_invoke_core(const void *sym_j, const void *argdesc_j, int32_t
 }
 /* Typed entry points — the frontend picks one by the native method's return type,
  * so the Call's result type matches the C signature exactly. */
-int32_t jrt_jni_invoke_i(const void *s, const void *a, int32_t st, void *r) { return (int32_t)jni_invoke_core(s, a, 'I', st, r); }
-int64_t jrt_jni_invoke_j(const void *s, const void *a, int32_t st, void *r) { return jni_invoke_core(s, a, 'J', st, r); }
-float   jrt_jni_invoke_f(const void *s, const void *a, int32_t st, void *r) { int32_t b = (int32_t)jni_invoke_core(s, a, 'F', st, r); float f; memcpy(&f, &b, 4); return f; }
-double  jrt_jni_invoke_d(const void *s, const void *a, int32_t st, void *r) { int64_t b = jni_invoke_core(s, a, 'D', st, r); double d; memcpy(&d, &b, 8); return d; }
-void   *jrt_jni_invoke_p(const void *s, const void *a, int32_t st, void *r) { return (void *)(intptr_t)jni_invoke_core(s, a, 'L', st, r); }
-void    jrt_jni_invoke_v(const void *s, const void *a, int32_t st, void *r) { jni_invoke_core(s, a, 'V', st, r); }
+int32_t jrt_jni_invoke_i(const void *s, const void *a, const void *cl, int32_t st, void *r) { return (int32_t)jni_invoke_core(s, a, cl, 'I', st, r); }
+int64_t jrt_jni_invoke_j(const void *s, const void *a, const void *cl, int32_t st, void *r) { return jni_invoke_core(s, a, cl, 'J', st, r); }
+float   jrt_jni_invoke_f(const void *s, const void *a, const void *cl, int32_t st, void *r) { int32_t b = (int32_t)jni_invoke_core(s, a, cl, 'F', st, r); float f; memcpy(&f, &b, 4); return f; }
+double  jrt_jni_invoke_d(const void *s, const void *a, const void *cl, int32_t st, void *r) { int64_t b = jni_invoke_core(s, a, cl, 'D', st, r); double d; memcpy(&d, &b, 8); return d; }
+void   *jrt_jni_invoke_p(const void *s, const void *a, const void *cl, int32_t st, void *r) { return (void *)(intptr_t)jni_invoke_core(s, a, cl, 'L', st, r); }
+void    jrt_jni_invoke_v(const void *s, const void *a, const void *cl, int32_t st, void *r) { jni_invoke_core(s, a, cl, 'V', st, r); }
 
 /* Load an already-built native module (.so) by path, verify its ABI, register its
  * classes, and run fjc_module_main. Shared by the M1 and M2 entry points. */
@@ -4544,12 +4551,12 @@ void jrt_jni_arg_j(int64_t v) { (void)v; }
 void jrt_jni_arg_f(float v) { (void)v; }
 void jrt_jni_arg_d(double v) { (void)v; }
 void jrt_jni_arg_p(void *v) { (void)v; }
-int32_t jrt_jni_invoke_i(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0; }
-int64_t jrt_jni_invoke_j(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0; }
-float jrt_jni_invoke_f(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0.0f; }
-double jrt_jni_invoke_d(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0.0; }
-void *jrt_jni_invoke_p(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return (void *)0; }
-void jrt_jni_invoke_v(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; }
+int32_t jrt_jni_invoke_i(const void *a, const void *b, const void *cl, int32_t c, void *d) { (void)a; (void)b; (void)cl; (void)c; (void)d; return 0; }
+int64_t jrt_jni_invoke_j(const void *a, const void *b, const void *cl, int32_t c, void *d) { (void)a; (void)b; (void)cl; (void)c; (void)d; return 0; }
+float jrt_jni_invoke_f(const void *a, const void *b, const void *cl, int32_t c, void *d) { (void)a; (void)b; (void)cl; (void)c; (void)d; return 0.0f; }
+double jrt_jni_invoke_d(const void *a, const void *b, const void *cl, int32_t c, void *d) { (void)a; (void)b; (void)cl; (void)c; (void)d; return 0.0; }
+void *jrt_jni_invoke_p(const void *a, const void *b, const void *cl, int32_t c, void *d) { (void)a; (void)b; (void)cl; (void)c; (void)d; return (void *)0; }
+void jrt_jni_invoke_v(const void *a, const void *b, const void *cl, int32_t c, void *d) { (void)a; (void)b; (void)cl; (void)c; (void)d; }
 int32_t jrt_load_jar_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 #endif
 

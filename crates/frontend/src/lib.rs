@@ -998,6 +998,7 @@ fn emit_jni_native(
     }
     let sid = program.intern_string(&sym);
     let aid = program.intern_string(&argdesc);
+    let cid = program.intern_string(class);   // declaring class (for the static jclass)
     let invfn = match rty {
         Ty::I32 => "jrt_jni_invoke_i",
         Ty::I64 => "jrt_jni_invoke_j",
@@ -1009,6 +1010,7 @@ fn emit_jni_native(
     let iargs = vec![
         Operand::ConstStr(sid),
         Operand::ConstStr(aid),
+        Operand::ConstStr(cid),
         Operand::ConstI32(if is_static { 1 } else { 0 }),
         recv,
     ];
