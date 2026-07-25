@@ -4017,6 +4017,33 @@ static void    jni_bridge_setobjectfield(void *e, void *o, void *f, void *v){ (v
 #undef FLD
 static int32_t jni_bridge_getversion(void *e) { (void)e; return 0x00010008; }   /* JNI 1.8 */
 
+/* Reference management — maps onto fastjavac's RC: a global/local ref is a retained
+ * pointer; deleting releases it. Weak refs don't retain (best-effort). */
+static void *jni_bridge_newref(void *e, void *o) { (void)e; jrt_retain(o); return o; }
+static void  jni_bridge_delref(void *e, void *o) { (void)e; jrt_release(o); }
+static void *jni_bridge_newweakref(void *e, void *o) { (void)e; return o; }
+static void  jni_bridge_noref(void *e, void *o) { (void)e; (void)o; }
+static int32_t jni_bridge_issame(void *e, void *a, void *b) { (void)e; return a == b ? 1 : 0; }
+static int32_t jni_bridge_isinstanceof(void *e, void *o, void *cls) {
+    (void)e;
+    if (!o) return 1;                              /* JNI: null is instanceof anything */
+    if (!cls) return 0;
+    const FjcClass *oc = jni_class_by_vtable(*(void **)((char *)o + 8));
+    for (const FjcClass *c = oc; c; c = c->super)
+        if (c == (const FjcClass *)cls) return 1;
+    /* interfaces */
+    if (oc)
+        for (const FjcClass *c = oc; c; c = c->super)
+            for (uint32_t i = 0; i < c->n_ifaces; i++)
+                if (c->ifaces[i] == (const FjcClass *)cls) return 1;
+    return 0;
+}
+static int32_t jni_bridge_localcap(void *e, int32_t n) { (void)e; (void)n; return 0; }   /* success */
+static void *jni_bridge_poplocalframe(void *e, void *r) { (void)e; return r; }
+static int32_t jni_bridge_pushlocalframe(void *e, int32_t n) { (void)e; (void)n; return 0; }
+static void *jni_bridge_nullptr(void *e) { (void)e; return NULL; }   /* ExceptionOccurred */
+static int32_t jni_bridge_zero(void *e) { (void)e; return 0; }       /* ExceptionCheck */
+
 static void *jni_table[236];                 /* JNINativeInterface_ slot count */
 static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
 static int jni_ready;                        /* 0 unknown, 1 ok, -1 unavailable */
@@ -4100,6 +4127,20 @@ static void jni_env_setup(void) {
     jni_table[110] = (void *)jni_bridge_setlongfield;
     jni_table[111] = (void *)jni_bridge_setfloatfield;
     jni_table[112] = (void *)jni_bridge_setdoublefield;
+    /* references (RC), identity, instanceof, local-frame + exception-state stubs */
+    jni_table[15]  = (void *)jni_bridge_nullptr;         /* ExceptionOccurred → none */
+    jni_table[19]  = (void *)jni_bridge_pushlocalframe;
+    jni_table[20]  = (void *)jni_bridge_poplocalframe;
+    jni_table[21]  = (void *)jni_bridge_newref;          /* NewGlobalRef */
+    jni_table[22]  = (void *)jni_bridge_delref;          /* DeleteGlobalRef */
+    jni_table[23]  = (void *)jni_bridge_delref;          /* DeleteLocalRef */
+    jni_table[24]  = (void *)jni_bridge_issame;
+    jni_table[25]  = (void *)jni_bridge_newref;          /* NewLocalRef */
+    jni_table[26]  = (void *)jni_bridge_localcap;
+    jni_table[32]  = (void *)jni_bridge_isinstanceof;
+    jni_table[226] = (void *)jni_bridge_newweakref;
+    jni_table[227] = (void *)jni_bridge_noref;           /* DeleteWeakGlobalRef */
+    jni_table[228] = (void *)jni_bridge_zero;            /* ExceptionCheck → false */
     jni_table_ptr = jni_table;
 }
 
