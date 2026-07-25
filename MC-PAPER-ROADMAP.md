@@ -177,10 +177,13 @@ built to the reachable set, not the whole JDK.
    (`jrt_jit_run` in `runtime.c`, engine `spikes/jit_engine.c`, test `tests/jit.sh`): a
    `--dynamic` binary reads a `.class` at runtime, extracts a method's bytecode with a
    minimal in-C classfile parser, copy-and-patch-compiles it to native x86-64, and runs it
-   (incl. loops/branches) — no AOT of that method, no subprocess. Remaining for this
-   milestone: the full per-bytecode stencil set (objects/calls/longs/floats/exceptions),
-   the `defineClass(byte[])` entry (JIT from in-memory bytes, not just a file), and object
-   arguments/returns.
+   (incl. loops/branches) — no AOT of that method, no subprocess. The **`defineClass(byte[])`
+   entry is also done** (`jrt_jit_raw` for a raw method blob, `jrt_define_and_run` for an
+   in-memory class file, `tests/jitmem.sh`): bytecode a program generates in memory at
+   runtime is JITted to native code in-process — the bridge to ASM/Mixin. Remaining for
+   this milestone: the full per-bytecode stencil set (objects/field access/calls/longs/
+   floats/exceptions), object arguments/returns, and a real `ClassLoader` registering the
+   JITted methods into the FjcClass registry so they dispatch like any other class.
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
