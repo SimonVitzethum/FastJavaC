@@ -105,9 +105,13 @@ parallel execution model — it only edits native code that the CPU runs directl
 > `<clinit>` → folded offset → shared helpers), closing the "VarHandle pervasively" item.
 > Real OpenJDK `AtomicInteger`/`AtomicLong` (Unsafe) compile+run+heap-balance, and
 > `AtomicReference`'s VarHandle mechanism runs heap-balanced — the first real JDK classes with
-> native methods running end-to-end. Remaining native backlog below; nearest next items:
-> `Object`/`System`/`Class` core natives (`arraycopy`, `hashCode`, `getClass`, `clone`),
-> `arrayBaseOffset`/`arrayIndexScale`, `Integer.TYPE` (`int.class`), then `java.io`/`nio`.
+> native methods running end-to-end. **`Object`/`System`/`Class` core natives** added
+> (`identityHashCode`, `isInstance`, `isAssignableFrom`, on top of the existing `arraycopy`/
+> `getClass`/`getName`/…). **`java.io` file I/O STARTED:** `FileInputStream`/`FileOutputStream`
+> over real `open`/`read`/`write`/`close` syscalls (runtime-backed JObj holding an fd; drop
+> closes it → no leak), verified by a round-trip that hits disk and heap-balances. Nearest next
+> items: `IOException` mapping + try-with-resources `close`, `Object.clone`, `Integer.TYPE`
+> (`int.class`), buffered streams / Readers, then `sun.nio.ch` (the Netty/Paper transport).
 
 - **Compile the pure-Java OpenJDK classes** (from `jmods`/`src`) with fastjavac. Most of
   `java.util`, `java.io`, `java.nio`, `java.util.stream`, `java.util.concurrent` is pure
