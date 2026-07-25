@@ -2697,6 +2697,8 @@ typedef int64_t (*jit_fn)(int64_t *); /* returns rax: int (low32), long, or refe
 static void je1(unsigned char b) { JIT_CODE[JIT_LEN++] = b; }
 static void jeN(const void *p, int n) { memcpy(JIT_CODE + JIT_LEN, p, (size_t)n); JIT_LEN += n; }
 static void je_i32(int32_t v) { jeN(&v, 4); }
+static void je_i64(int64_t v) { jeN(&v, 8); }
+static void je_push_imm64(int64_t v) { je1(0x48); je1(0xB8); je_i64(v); je1(0x50); } /* mov rax,imm64; push rax */
 static void je_push_local(int i) { je1(0xFF); je1(0x77); je1((unsigned char)(8 * i)); }
 static void je_pop_local(int i) { je1(0x8F); je1(0x47); je1((unsigned char)(8 * i)); }
 static void je_push_imm(int32_t v) { je1(0x68); je_i32(v); }
@@ -2759,6 +2761,28 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n) {
             case 0x65: je1(0x58); jeN("\x48\x29\x04\x24", 4); pc++; break;           /* lsub (64-bit) */
             case 0x69: je1(0x58); jeN("\x48\x0F\xAF\x04\x24", 5); jeN("\x48\x89\x04\x24", 4); pc++; break; /* lmul */
             case 0xad: je1(0x58); je1(0xC3); pc++; break;                            /* lreturn */
+            case 0x85: je1(0x58); jeN("\x48\x63\xC0", 3); je1(0x50); pc++; break;    /* i2l: movsxd rax,eax */
+            case 0x88: pc++; break;                                                 /* l2i: no-op (int ops use low 32) */
+            /* --- doubles (64-bit slots holding the bit pattern; arithmetic via xmm) --- */
+            case 0x0e: je_push_imm(0); pc++; break;                                  /* dconst_0 (bits of 0.0) */
+            case 0x0f: je_push_imm64((int64_t)0x3FF0000000000000LL); pc++; break;    /* dconst_1 (bits of 1.0) */
+            case 0x18: je_push_local(bc[pc + 1]); pc += 2; break;                    /* dload */
+            case 0x26: case 0x27: case 0x28: case 0x29: je_push_local(op - 0x26); pc++; break; /* dload_0..3 */
+            case 0x39: je_pop_local(bc[pc + 1]); pc += 2; break;                     /* dstore */
+            case 0x47: case 0x48: case 0x49: case 0x4a: je_pop_local(op - 0x47); pc++; break;  /* dstore_0..3 */
+            /* d<op>: pop rax(v2); movq xmm1,rax; movq xmm0,[rsp](v1); OPsd xmm0,xmm1; movq [rsp],xmm0 */
+            case 0x63: case 0x67: case 0x6b: case 0x6f: {
+                unsigned char opc = op == 0x63 ? 0x58 : op == 0x67 ? 0x5C : op == 0x6b ? 0x59 : 0x5E; /* add/sub/mul/div sd */
+                je1(0x58);
+                jeN("\x66\x48\x0F\x6E\xC8", 5); /* movq xmm1, rax  */
+                jeN("\xF3\x0F\x7E\x04\x24", 5); /* movq xmm0, [rsp] */
+                je1(0xF2); je1(0x0F); je1(opc); je1(0xC1); /* OPsd xmm0, xmm1 */
+                jeN("\x66\x0F\xD6\x04\x24", 5); /* movq [rsp], xmm0 */
+                pc++; break;
+            }
+            case 0xaf: jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je1(0xC3); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
+            case 0x87: je1(0x58); jeN("\xF2\x0F\x2A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* i2d: cvtsi2sd xmm0,eax; movq rax,xmm0; push */
+            case 0x8e: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* d2i: movq xmm0,rax; cvttsd2si eax,xmm0; push */
             default: return NULL; /* unsupported opcode */
         }
         if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
@@ -3058,6 +3082,19 @@ void *jrt_call_static_ref(const void *cls_j, const void *m_j, const void *d_j, c
     if (res) jrt_retain(res); /* +1 transfer to the host */
     return res;
 }
+
+/* Double invoker (point 1): a (D)D JITted method returns its result in xmm0, so call it
+ * through a double-returning pointer. The double argument's bits go into locals[0]. */
+double jrt_call_double(const void *cls_j, const void *m_j, const void *d_j, double arg) {
+    char cls[256], m[256], d[256];
+    jstr_to_cstr(cls_j, cls, sizeof cls); jstr_to_cstr(m_j, m, sizeof m); jstr_to_cstr(d_j, d, sizeof d);
+    const FjcMethod *mm = jrt_method(jrt_class_by_name(cls), m, d);
+    if (!mm || !mm->code) return 0.0;
+    int64_t locals[64] = {0};
+    memcpy(&locals[0], &arg, sizeof(double));
+    double (*fn)(int64_t *) = (double (*)(int64_t *))mm->code;
+    return fn(locals);
+}
 #else
 int32_t jrt_jit_run(const void *a, const void *b, const void *c, int32_t d) {
     (void)a; (void)b; (void)c; (void)d; return -100; /* needs --dynamic on x86-64 */
@@ -3072,6 +3109,7 @@ int32_t jrt_define_class_jit(const void *a) { (void)a; return -100; }
 int64_t jrt_call_static(const void *a, const void *b, const void *c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -100; }
 int32_t jrt_call_static_obj1(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return -100; }
 void *jrt_call_static_ref(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return (void *)0; }
+double jrt_call_double(const void *a, const void *b, const void *c, double d) { (void)a; (void)b; (void)c; (void)d; return 0.0; }
 #endif
 
 /* ---- M1: load a native module (.so) and run its entry point ----------------

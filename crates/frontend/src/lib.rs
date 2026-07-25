@@ -2794,6 +2794,8 @@ fn lower_block(
                         ("__fjc_call_obj1", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)I") => ("jrt_call_static_obj1", 4),
                         // Object-returning call (retains the result per the +1 ref contract):
                         ("__fjc_call_ref", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;") => ("jrt_call_static_ref", 4),
+                        // Double-returning call (result in xmm0):
+                        ("__fjc_call_d", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;D)D") => ("jrt_call_double", 4),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();
@@ -2803,11 +2805,15 @@ fn lower_block(
                     args.reverse();
                     let ret_ty = match desc.rsplit_once(')').and_then(|(_, r)| r.chars().next()) {
                         Some('J') => Ty::I64,
+                        Some('D') => Ty::F64,
+                        Some('F') => Ty::F32,
                         Some('L') | Some('[') => Ty::Ref,
                         _ => Ty::I32,
                     };
                     let placeholder = match ret_ty {
                         Ty::I64 => Operand::ConstI64(0),
+                        Ty::F64 => Operand::ConstF64(0.0),
+                        Ty::F32 => Operand::ConstF32(0.0),
                         Ty::Ref => Operand::ConstNull,
                         _ => Operand::ConstI32(0),
                     };

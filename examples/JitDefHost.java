@@ -9,6 +9,7 @@ public class JitDefHost {
     static native long __fjc_call(String cls, String method, String desc, int arg);
     static native int __fjc_call_obj1(String cls, String method, String desc, Object arg);
     static native Object __fjc_call_ref(String cls, String method, String desc, Object arg);
+    static native double __fjc_call_d(String cls, String method, String desc, double arg);
 
     public static void main(String[] args) {
         int sz = __fjc_file_size("./JitDefined.class");
@@ -25,7 +26,11 @@ public class JitDefHost {
         Object back = __fjc_call_ref("JitDefined", "id", "(Ljava/lang/Object;)Ljava/lang/Object;", token);
         if (back != token) throw new RuntimeException("id identity");           // object return, RC-balanced
 
-        if (n < 4 || sq != 49 || db != 4000000000L || notNull != 0 || isN != 1)
+        double d1 = __fjc_call_d("JitDefined", "dsum", "(D)D", 2.5);            // 6.0
+        double d2 = __fjc_call_d("JitDefined", "twiceTrunc", "(D)D", 3.7);      // 6.0 (d2i+i2d)
+        if (d1 != 6.0 || d2 != 6.0) throw new RuntimeException("double " + d1 + "," + d2);
+
+        if (n < 6 || sq != 49 || db != 4000000000L || notNull != 0 || isN != 1)
             throw new RuntimeException("jit-classloader " + n + "," + sq + "," + db + "," + notNull + "," + isN);
         System.out.println(sq);
         System.out.println(db);
