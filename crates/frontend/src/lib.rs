@@ -1933,6 +1933,14 @@ fn lower_block(
                     stack.push(Ty::Ref);
                     continue;
                 }
+                // java.io file streams are runtime-backed JObjs holding an fd:
+                // new → jrt_stream_new (the <init> opens the file, see invokespecial).
+                if class == "java/io/FileInputStream" || class == "java/io/FileOutputStream" {
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stmts.push(Statement::Call { dest: Some(l), func: "jrt_stream_new".to_string(), args: vec![] });
+                    stack.push(Ty::Ref);
+                    continue;
+                }
                 if program.class(&class).is_none() {
                     return Err(FrontendError::Unsupported(format!("new {class} (class not in the closed-world input)")));
                 }
@@ -1992,6 +2000,28 @@ fn lower_block(
                         });
                     }
                     continue;
+                }
+                // File-stream constructors open the file (the object came from
+                // jrt_stream_new). args = [receiver, path(, append)].
+                if (class == "java/io/FileInputStream" || class == "java/io/FileOutputStream")
+                    && name == "<init>"
+                {
+                    if class == "java/io/FileInputStream" && desc == "(Ljava/lang/String;)V" {
+                        stmts.push(Statement::Call { dest: None, func: "jrt_fis_open".into(), args });
+                        continue;
+                    }
+                    if class == "java/io/FileOutputStream" && desc == "(Ljava/lang/String;)V" {
+                        args.push(Operand::ConstI32(0)); // append = false
+                        stmts.push(Statement::Call { dest: None, func: "jrt_fos_open".into(), args });
+                        continue;
+                    }
+                    if class == "java/io/FileOutputStream" && desc == "(Ljava/lang/String;Z)V" {
+                        stmts.push(Statement::Call { dest: None, func: "jrt_fos_open".into(), args });
+                        continue;
+                    }
+                    return Err(FrontendError::Unsupported(format!(
+                        "{class}.<init>{desc} (supported: (String), FileOutputStream also (String,boolean))"
+                    )));
                 }
                 if name == "<init>" && program.class(&class).is_none() {
                     // Constructor of a non-modelled base class
@@ -2253,6 +2283,56 @@ fn lower_block(
                     let f = if name == "println" { "jrt_println_str" } else { "jrt_print_str" };
                     stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(s)] });
                     continue;
+                }
+                // java.io file-stream methods (runtime-backed over syscalls). The
+                // receiver is the JFileStream from jrt_stream_new regardless of the
+                // static type (concrete or the abstract InputStream/OutputStream).
+                if matches!(
+                    class,
+                    "java/io/FileInputStream"
+                        | "java/io/FileOutputStream"
+                        | "java/io/InputStream"
+                        | "java/io/OutputStream"
+                ) {
+                    // (func, ret type, arg count excluding receiver)
+                    let route: Option<(&str, Ty, usize)> = match (name, desc) {
+                        ("read", "()I") => Some(("jrt_fis_read", Ty::I32, 0)),
+                        ("read", "([B)I") => Some(("jrt_fis_read_bytes", Ty::I32, 1)),
+                        ("read", "([BII)I") => Some(("jrt_fis_read_region", Ty::I32, 3)),
+                        ("write", "(I)V") => Some(("jrt_fos_write", Ty::Void, 1)),
+                        ("write", "([B)V") => Some(("jrt_fos_write_bytes", Ty::Void, 1)),
+                        ("write", "([BII)V") => Some(("jrt_fos_write_region", Ty::Void, 3)),
+                        ("close", "()V") => Some(("jrt_stream_close", Ty::Void, 0)),
+                        ("flush", "()V") => Some(("__noop", Ty::Void, 0)), // unbuffered
+                        _ => None,
+                    };
+                    if let Some((func, rty, nargs)) = route {
+                        let mut args = Vec::new();
+                        for _ in 0..nargs {
+                            args.push(Operand::Copy(pop!()));
+                        }
+                        let recv = pop!();
+                        args.push(Operand::Copy(recv));
+                        args.reverse(); // [receiver, arg1, …]
+                        if func != "__noop" {
+                            let dest = if rty == Ty::Void {
+                                None
+                            } else {
+                                let l = ml.stack_slot(stack.len(), rty);
+                                stack.push(rty);
+                                Some(l)
+                            };
+                            stmts.push(Statement::Call { dest, func: func.to_string(), args });
+                        }
+                        // read/write on a bad fd return -1/no-op rather than throwing;
+                        // NPE on a null receiver is still possible.
+                        throw_after = Some(*pc);
+                        continue;
+                    }
+                    return Err(FrontendError::Unsupported(format!(
+                        "{class}.{name}{desc} (file-stream subset: read()/read([B)/read([BII), \
+                         write(I)/write([B)/write([BII), close, flush)"
+                    )));
                 }
                 // StringBuilder methods (runtime-backed). append returns this
                 // (chaining), toString a new string.
