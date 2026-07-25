@@ -3419,6 +3419,54 @@ void jrt_io_close(int32_t fd) {
     if (fd >= 0) close(fd);
 }
 
+/* --- TCP socket leaves (java.net stubs bottom out here; read/write/close reuse
+ * the fd-based jrt_io_* above, since a socket is just an fd). IPv4. Connection
+ * failure returns -1 and the stub throws java.io.IOException. */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+int32_t jrt_net_connect(const void *host_j, int32_t port) {
+    char host[256];
+    jstr_to_cstr(host_j, host, sizeof host);
+    if (!host[0]) return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    if (addr.sin_addr.s_addr == INADDR_NONE) {
+        struct hostent *he = gethostbyname(host); /* simple name resolution */
+        if (!he || !he->h_addr_list[0]) return -1;
+        memcpy(&addr.sin_addr, he->h_addr_list[0], sizeof addr.sin_addr);
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+int32_t jrt_net_listen(int32_t port, int32_t backlog) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { close(fd); return -1; }
+    if (listen(fd, backlog > 0 ? backlog : 16) < 0) { close(fd); return -1; }
+    return fd;
+}
+int32_t jrt_net_accept(int32_t fd) {
+    if (fd < 0) return -1;
+    return accept(fd, (struct sockaddr *)0, (socklen_t *)0);
+}
+
 /* defineClass primitive: JIT a RAW method-bytecode blob that lives only in memory —
  * e.g. bytes a program generated at runtime (ASM/Mixin/ByteBuddy emit exactly this) —
  * and run it with one int arg. No file, no classfile wrapper, no subprocess: the
@@ -3716,6 +3764,9 @@ int32_t jrt_io_readb(int32_t a, const void *b, int32_t c, int32_t d) { (void)a; 
 void jrt_io_write1(int32_t a, int32_t b) { (void)a; (void)b; }
 void jrt_io_writeb(int32_t a, const void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; }
 void jrt_io_close(int32_t a) { (void)a; }
+int32_t jrt_net_connect(const void *a, int32_t b) { (void)a; (void)b; return -1; }
+int32_t jrt_net_listen(int32_t a, int32_t b) { (void)a; (void)b; return -1; }
+int32_t jrt_net_accept(int32_t a) { (void)a; return -1; }
 int32_t jrt_define_class_jit(const void *a) { (void)a; return -100; }
 int64_t jrt_call_static(const void *a, const void *b, const void *c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -100; }
 int32_t jrt_call_static_obj1(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return -100; }
