@@ -217,16 +217,21 @@ built to the reachable set, not the whole JDK.
    **Float/double call args + results — DONE** (`tests/jitfloat.sh`): the JIT↔AOT native
    marshaller is descriptor-driven (int/ref/long→RDI..R9, float/double→XMM0..7), results are
    read from RAX or XMM0 by return type, and RC release is wired into dreturn/freturn.
-   **Remaining — the reverse AOT→JIT direction only:** a JIT-defined override installed in
-   an AOT vtable slot and called *by AOT code* still can't consume its native args, because
-   JITted methods use a locals-array entry (fed by the invokers), not a native-arg prologue.
-   The fix is a coherent but fundamental change: give JIT methods a native entry (allocate a
-   stack locals frame, spill the arg registers into it per the descriptor + max_locals),
-   make the invokers call JIT methods with native args, and unify the invoke path to always
-   native-marshal — after which JIT and AOT are ABI-identical and fully JIT-defined
-   polymorphic subclasses work. Also minor: >6-arg calls (stack args; currently such methods
-   are simply not JITted) and full exception semantics (uncaught propagation across methods,
-   per-pc stack-depth reset for deep throws, type-narrowed catches).
+   **Reverse AOT→JIT + fully JIT-defined polymorphic subclasses — DONE** (`tests/jitmod.sh`).
+   JITted methods now have a **native entry** (the prologue allocates a stack locals frame,
+   points RBX at it, and spills the incoming native arg registers — int/ref/long from
+   RDI..R9, float/double from XMM0..7 — per descriptor + max_locals + static-ness). Every
+   invoke native-marshals for all callees (code loaded via &FjcMethod so recursion/forward
+   refs resolve), and every invoker calls JIT methods with native args. So **JIT and AOT are
+   now ABI-identical in both directions**: a JIT-defined class can extend an AOT class,
+   override methods (installed in the inherited vtable), be `new`'d, and have its overrides
+   dispatched virtually by AOT *or* JIT code — the mod/Mixin pattern, RC-freed and
+   heap-balanced. **Only minor items remain:** >6-arg calls (stack args; such methods are
+   currently just not JITted — a safe skip) and full exception semantics (uncaught
+   propagation across method boundaries, per-pc stack-depth reset for deep throws,
+   type-narrowed catches). The Tier-1 JIT is otherwise a working execution engine for the
+   int/long/float/double + reference + array + control-flow + call + exception subset, with
+   correct RC and JIT↔AOT interop.
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
