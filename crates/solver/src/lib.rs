@@ -83,6 +83,19 @@ pub fn run(program: &mut Program) -> Stats {
             roots.push(name.clone());
         }
     }
+    // Open-world (--dynamic): a virtual method may be invoked by dynamically loaded /
+    // JIT-defined code that RTA cannot see, so pruning it (leaving a null vtable slot)
+    // would crash a later virtual dispatch. Keep every virtual method with a body as a
+    // root, so vtables stay fully populated for runtime dispatch.
+    if program.dynamic {
+        for c in &program.classes {
+            for m in &c.methods {
+                if m.is_virtual() && m.has_body && func_index.contains_key(&m.mangled) {
+                    roots.push(m.mangled.clone());
+                }
+            }
+        }
+    }
     // Runnable.run() implementations are invoked through the native thread
     // trampoline (invisible to RTA) → treat them as roots.
     if program.class("java/lang/Runnable").is_some() {

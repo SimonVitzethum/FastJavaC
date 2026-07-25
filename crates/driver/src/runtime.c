@@ -2972,6 +2972,35 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 if (!voidret) je1(0x50);                           /* push rax (result) */
                 pc += 3; break;
             }
+            /* --- invokevirtual / invokeinterface: dispatch through the RECEIVER's vtable
+             * at runtime (polymorphism). The static method resolves to a vtable slot; the
+             * actual code is receiver->vtable[slot], so a subclass override is called. --- */
+            case 0xb6: case 0xb9: {
+                char mdesc[256];
+                const FjcMethod *m = jit_resolve_method(cp, (bc[pc + 1] << 8) | bc[pc + 2], mdesc, sizeof mdesc);
+                if (!m || m->vtable_index < 0) return NULL; /* need a real vtable slot */
+                int voidret = 0, kargs = jit_arg_count(mdesc, &voidret);
+                if (kargs < 0) return NULL;
+                int K = kargs + 1; /* + receiver (arg0) */
+                if (K > 60) return NULL;
+                int slot = m->vtable_index;
+                je1(0x48); je1(0x81); je1(0xEC); je_i32(528);      /* sub rsp,528 */
+                jeN("\x48\x89\x3C\x24", 4);                        /* mov [rsp], rdi */
+                for (int i = 0; i < K; i++) {
+                    jeN("\x48\x8B\x84\x24", 4); je_i32(528 + 8 * (K - 1 - i)); /* mov rax,[rsp+arg] */
+                    jeN("\x48\x89\x84\x24", 4); je_i32(8 + 8 * i);            /* mov [rsp+local],rax */
+                }
+                jeN("\x48\x8B\x44\x24\x08", 5);                    /* mov rax,[rsp+8] (receiver) */
+                jeN("\x48\x8B\x40\x08", 4);                        /* mov rax,[rax+8]  (vtable) */
+                jeN("\x48\x8B\x80", 3); je_i32(8 * slot);          /* mov rax,[rax+8*slot] (code) */
+                jeN("\x48\x8D\x7C\x24\x08", 5);                    /* lea rdi,[rsp+8] (callee locals) */
+                jeN("\xFF\xD0", 2);                                /* call rax */
+                jeN("\x48\x8B\x3C\x24", 4);                        /* mov rdi,[rsp] (restore) */
+                je1(0x48); je1(0x81); je1(0xC4); je_i32(528);      /* add rsp,528 */
+                if (K > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * K); } /* pop args */
+                if (!voidret) je1(0x50);                           /* push result */
+                pc += (op == 0xb9) ? 5 : 3; break;                /* invokeinterface has 2 extra operand bytes */
+            }
             default: return NULL; /* unsupported opcode */
         }
         if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
