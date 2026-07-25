@@ -2692,7 +2692,7 @@ static int JIT_NOFF[1 << 16];
 typedef struct { int off, target_pc; } JitFix;
 static JitFix JIT_FIX[4096];
 static int JIT_NFIX;
-typedef int32_t (*jit_fn)(int64_t *);
+typedef int64_t (*jit_fn)(int64_t *); /* returns rax: int (low32), long, or reference */
 
 static void je1(unsigned char b) { JIT_CODE[JIT_LEN++] = b; }
 static void jeN(const void *p, int n) { memcpy(JIT_CODE + JIT_LEN, p, (size_t)n); JIT_LEN += n; }
@@ -2735,6 +2735,30 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n) {
             case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:        /* if_icmp<cond> */
                 je1(0x58); je1(0x59); jeN("\x39\xC1", 2); je_jcc(CC[op - 0x9f], pc + je_s16(bc + pc + 1)); pc += 3; break;
             case 0xac: je1(0x58); je1(0xC3); pc++; break;                            /* ireturn */
+            /* --- references (opaque 64-bit pointers; fit the same 64-bit slots) --- */
+            case 0x01: je_push_imm(0); pc++; break;                                  /* aconst_null */
+            case 0x19: je_push_local(bc[pc + 1]); pc += 2; break;                    /* aload */
+            case 0x2a: case 0x2b: case 0x2c: case 0x2d: je_push_local(op - 0x2a); pc++; break; /* aload_0..3 */
+            case 0x3a: je_pop_local(bc[pc + 1]); pc += 2; break;                     /* astore */
+            case 0x4b: case 0x4c: case 0x4d: case 0x4e: je_pop_local(op - 0x4b); pc++; break;  /* astore_0..3 */
+            case 0xb0: je1(0x58); je1(0xC3); pc++; break;                            /* areturn */
+            case 0xa5: case 0xa6:                                                    /* if_acmpeq/ne (64-bit) */
+                je1(0x58); je1(0x59); jeN("\x48\x39\xC1", 3);
+                je_jcc(op == 0xa5 ? 0x84 : 0x85, pc + je_s16(bc + pc + 1)); pc += 3; break;
+            case 0xc6: case 0xc7:                                                    /* ifnull/ifnonnull */
+                je1(0x58); jeN("\x48\x85\xC0", 3);
+                je_jcc(op == 0xc6 ? 0x84 : 0x85, pc + je_s16(bc + pc + 1)); pc += 3; break;
+            /* --- longs (one 64-bit slot per long; not JVM's two — internally consistent) --- */
+            case 0x09: je_push_imm(0); pc++; break;                                  /* lconst_0 */
+            case 0x0a: je_push_imm(1); pc++; break;                                  /* lconst_1 */
+            case 0x16: je_push_local(bc[pc + 1]); pc += 2; break;                    /* lload */
+            case 0x1e: case 0x1f: case 0x20: case 0x21: je_push_local(op - 0x1e); pc++; break; /* lload_0..3 */
+            case 0x37: je_pop_local(bc[pc + 1]); pc += 2; break;                     /* lstore */
+            case 0x3f: case 0x40: case 0x41: case 0x42: je_pop_local(op - 0x3f); pc++; break;  /* lstore_0..3 */
+            case 0x61: je1(0x58); jeN("\x48\x01\x04\x24", 4); pc++; break;           /* ladd (64-bit) */
+            case 0x65: je1(0x58); jeN("\x48\x29\x04\x24", 4); pc++; break;           /* lsub (64-bit) */
+            case 0x69: je1(0x58); jeN("\x48\x0F\xAF\x04\x24", 5); jeN("\x48\x89\x04\x24", 4); pc++; break; /* lmul */
+            case 0xad: je1(0x58); je1(0xC3); pc++; break;                            /* lreturn */
             default: return NULL; /* unsupported opcode */
         }
         if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
@@ -2895,7 +2919,128 @@ int32_t jrt_define_and_run(const void *class_arr, const void *m_j, const void *d
     if (!fn) return -7;
     int64_t locals[64] = {0};
     locals[0] = arg;
-    return fn(locals);
+    return (int32_t)fn(locals);
+}
+
+/* ---- Tier-1 JIT ClassLoader: register JITted methods into the FjcClass registry ---- */
+static char *util8dup(const uint8_t *s, int len) {
+    char *r = (char *)malloc((size_t)len + 1);
+    if (r) { memcpy(r, s, (size_t)len); r[len] = '\0'; }
+    return r;
+}
+
+/* Parse an in-memory class file, JIT every method with a supported Code body, build an
+ * FjcClass carrying the JITted code pointers, and register it into the dynamic registry
+ * so its methods dispatch BY NAME exactly like any AOT/module class. Strings are copied
+ * and code is in mmap'd pages, so the input byte[] can be freed afterwards. Returns the
+ * number of methods successfully JITted, or negative on error. */
+static int cf_define_class(const uint8_t *f, long flen) {
+    if (flen < 10 || cf_be32(f) != 0xCAFEBABEu) return -1;
+    uint16_t cpc = cf_be16(f + 8);
+    const uint8_t **u = (const uint8_t **)calloc(cpc, sizeof(void *));
+    int *ul = (int *)calloc(cpc, sizeof(int));
+    uint16_t *cls_ni = (uint16_t *)calloc(cpc, sizeof(uint16_t)); /* Class entry -> name_index */
+    if (!u || !ul || !cls_ni) { free(u); free(ul); free(cls_ni); return -2; }
+    const uint8_t *p = f + 10;
+    for (int i = 1; i < cpc; i++) {
+        uint8_t tag = *p++;
+        switch (tag) {
+            case 1: { int len = cf_be16(p); u[i] = p + 2; ul[i] = len; p += 2 + len; } break;
+            case 7: cls_ni[i] = cf_be16(p); p += 2; break;
+            case 8: case 16: case 19: case 20: p += 2; break;
+            case 15: p += 3; break;
+            case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18: p += 4; break;
+            case 5: case 6: p += 8; i++; break;
+            default: free(u); free(ul); free(cls_ni); return -3;
+        }
+    }
+    uint16_t this_class = cf_be16(p + 2);          /* after access(2) */
+    p += 6;                                        /* access, this, super */
+    p += 2 + 2 * cf_be16(p);                       /* interfaces */
+    uint16_t fc = cf_be16(p); p += 2;              /* fields */
+    for (int i = 0; i < fc; i++) { p += 6; uint16_t ac = cf_be16(p); p += 2; for (int a = 0; a < ac; a++) { uint32_t al = cf_be32(p + 2); p += 6 + al; } }
+    uint16_t mc = cf_be16(p); p += 2;              /* methods */
+
+    FjcMethod *methods = (FjcMethod *)calloc(mc ? mc : 1, sizeof(FjcMethod));
+    if (!methods) { free(u); free(ul); free(cls_ni); return -4; }
+    int nm = 0, jitted = 0;
+    for (int i = 0; i < mc; i++) {
+        uint16_t maf = cf_be16(p); p += 2;
+        uint16_t ni = cf_be16(p); p += 2;
+        uint16_t di = cf_be16(p); p += 2;
+        uint16_t ac = cf_be16(p); p += 2;
+        const uint8_t *code = NULL; int codelen = 0;
+        for (int a = 0; a < ac; a++) {
+            uint16_t an = cf_be16(p); uint32_t al = cf_be32(p + 2); const uint8_t *body = p + 6;
+            if (an < cpc && cf_utf8eq(u[an], ul[an], "Code")) { codelen = (int)cf_be32(body + 4); code = body + 8; }
+            p += 6 + al;
+        }
+        if (ni >= cpc || di >= cpc) continue;
+        void *codeptr = NULL;
+        if (code && codelen > 0) { jit_fn fn = jit_compile_bc(code, codelen); if (fn) { codeptr = (void *)fn; jitted++; } }
+        methods[nm].name = util8dup(u[ni], ul[ni]);
+        methods[nm].desc = util8dup(u[di], ul[di]);
+        methods[nm].code = codeptr;
+        methods[nm].vtable_index = -1;
+        methods[nm].flags = (maf & 0x0008) ? 1u : 0u; /* ACC_STATIC */
+        nm++;
+    }
+
+    char *name = NULL;                             /* this_class -> Class -> Utf8, dotted */
+    if (this_class < cpc && cls_ni[this_class] && cls_ni[this_class] < cpc) {
+        uint16_t nidx = cls_ni[this_class];
+        name = util8dup(u[nidx], ul[nidx]);
+        if (name) for (char *q = name; *q; q++) if (*q == '/') *q = '.';
+    }
+    FjcClass *c = (FjcClass *)calloc(1, sizeof(FjcClass));
+    const FjcClass **arr = (const FjcClass **)calloc(1, sizeof(void *));
+    free(u); free(ul); free(cls_ni);
+    if (!c || !arr || !name) { free(c); free(arr); free(name); free(methods); return -5; }
+    c->abi_version = FJC_ABI_VERSION;
+    c->name = name;
+    c->n_methods = (uint32_t)nm;
+    c->methods = methods;
+    arr[0] = c;
+    fjc_register_dynamic((const FjcClass *const *)arr, 1, NULL);
+    return jitted;
+}
+
+/* defineClass + register: an in-memory class file becomes a live, name-dispatchable class
+ * whose methods are JITted native code. Returns #methods JITted (>=0) or negative error. */
+int32_t jrt_define_class_jit(const void *class_arr) {
+    if (!class_arr) return -1;
+    int64_t len = JARR_LEN(class_arr);
+    if (len <= 0 || len > (16 << 20)) return -2;
+    return cf_define_class(JARR_DATA(class_arr), len);
+}
+
+/* Invoke a registered JITted static method by class+method+desc — the SAME registry path
+ * (jrt_class_by_name/jrt_method) as AOT/module classes. int arg in locals[0]; returns rax
+ * (int in the low 32 bits, or a full 64-bit long). */
+int64_t jrt_call_static(const void *cls_j, const void *m_j, const void *d_j, int32_t arg) {
+    char cls[256], m[256], d[256];
+    jstr_to_cstr(cls_j, cls, sizeof cls); jstr_to_cstr(m_j, m, sizeof m); jstr_to_cstr(d_j, d, sizeof d);
+    const FjcMethod *mm = jrt_method(jrt_class_by_name(cls), m, d);
+    if (!mm || !mm->code) return 0;
+    int64_t locals[64] = {0}; locals[0] = arg;
+    int64_t r = ((jit_fn)mm->code)(locals);
+    /* int-family returns leave stale high bits (int ops write only EAX); a J return is a
+     * full 64-bit long. Normalize by the descriptor's return type. */
+    const char *rp = d;
+    while (*rp && *rp != ')') rp++;
+    return (*rp == ')' && rp[1] == 'J') ? r : (int64_t)(int32_t)r;
+}
+
+/* Same, passing a single object reference as the argument (point 2: objects flow INTO
+ * JITted methods). Returns the method's int result. Object RETURNS crossing back into the
+ * host's RC need a retain barrier on areturn — deferred; args are safe (borrowed). */
+int32_t jrt_call_static_obj1(const void *cls_j, const void *m_j, const void *d_j, const void *obj) {
+    char cls[256], m[256], d[256];
+    jstr_to_cstr(cls_j, cls, sizeof cls); jstr_to_cstr(m_j, m, sizeof m); jstr_to_cstr(d_j, d, sizeof d);
+    const FjcMethod *mm = jrt_method(jrt_class_by_name(cls), m, d);
+    if (!mm || !mm->code) return -1;
+    int64_t locals[64] = {0}; locals[0] = (int64_t)(uintptr_t)obj;
+    return (int32_t)((jit_fn)mm->code)(locals);
 }
 #else
 int32_t jrt_jit_run(const void *a, const void *b, const void *c, int32_t d) {
@@ -2907,6 +3052,9 @@ int32_t jrt_define_and_run(const void *a, const void *b, const void *c, int32_t 
 }
 int32_t jrt_file_size(const void *a) { (void)a; return -100; }
 int32_t jrt_read_into(const void *a, const void *b) { (void)a; (void)b; return -100; }
+int32_t jrt_define_class_jit(const void *a) { (void)a; return -100; }
+int64_t jrt_call_static(const void *a, const void *b, const void *c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -100; }
+int32_t jrt_call_static_obj1(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return -100; }
 #endif
 
 /* ---- M1: load a native module (.so) and run its entry point ----------------

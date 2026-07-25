@@ -2758,7 +2758,8 @@ fn lower_block(
                 // FjcClass metadata at runtime (Phase 0 / the `__fjc_` namespace is
                 // reserved, analogous to GCC `__builtin_`).
                 if name.starts_with("__fjc_") {
-                    // (jrt function, number of String parameters). All return int.
+                    // (jrt function, argument count). The return type is derived from
+                    // the descriptor (I/Z/B/C/S -> int, J -> long, L../[.. -> reference).
                     let (func, nargs): (&str, usize) = match (name, desc) {
                         ("__fjc_field_count", "(Ljava/lang/String;)I") => ("jrt_fjc_field_count", 1),
                         ("__fjc_method_count", "(Ljava/lang/String;)I") => ("jrt_fjc_method_count", 1),
@@ -2785,6 +2786,12 @@ fn lower_block(
                         // Helpers to load a class file into a Java byte[] (host-allocated):
                         ("__fjc_file_size", "(Ljava/lang/String;)I") => ("jrt_file_size", 1),
                         ("__fjc_read_into", "([BLjava/lang/String;)I") => ("jrt_read_into", 2),
+                        // Tier-1 JIT ClassLoader: define a class from an in-memory byte[]
+                        // (JIT all its methods, register into the FjcClass registry), then
+                        // invoke a registered static method by name (registry dispatch).
+                        ("__fjc_define_class", "([B)I") => ("jrt_define_class_jit", 1),
+                        ("__fjc_call", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J") => ("jrt_call_static", 4),
+                        ("__fjc_call_obj1", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)I") => ("jrt_call_static_obj1", 4),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();
@@ -2792,7 +2799,17 @@ fn lower_block(
                         args.push(Operand::Copy(pop!()));
                     }
                     args.reverse();
-                    let dest = push!(Ty::I32, Rvalue::Use(Operand::ConstI32(0)));
+                    let ret_ty = match desc.rsplit_once(')').and_then(|(_, r)| r.chars().next()) {
+                        Some('J') => Ty::I64,
+                        Some('L') | Some('[') => Ty::Ref,
+                        _ => Ty::I32,
+                    };
+                    let placeholder = match ret_ty {
+                        Ty::I64 => Operand::ConstI64(0),
+                        Ty::Ref => Operand::ConstNull,
+                        _ => Operand::ConstI32(0),
+                    };
+                    let dest = push!(ret_ty, Rvalue::Use(placeholder));
                     stmts.pop(); // placeholder
                     stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args });
                     continue;
