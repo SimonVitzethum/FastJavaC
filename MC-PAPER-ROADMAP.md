@@ -189,11 +189,14 @@ built to the reachable set, not the whole JDK.
    i2d/d2i, dreturn), **exceptions** (athrow → handler dispatch via the exception table,
    checkcast no-op), **object returns** with an RC retain barrier, and **field access**
    (getfield/putfield with offsets resolved from the FjcClass registry via the constant
-   pool). Tests: `tests/jit{class,field}.sh`. **Remaining:** method calls
-   (invoke*, needing a callee frame-setup convention), `new`/array creation, float (32-bit,
-   parallel to double), and full exception semantics (uncaught propagation, per-pc
-   stack-depth reset for deep throws, type-narrowed catches). With `new` + invoke*, a
-   JIT-defined class becomes fully self-contained — the last big step for this milestone.
+   pool), **method calls** (invokestatic + invokespecial, incl. self/mutual recursion, via
+   a callee frame-setup convention + two-pass class registration), **object creation**
+   (`new` + `<init>`, RC-correct for the factory create-and-return pattern), and **float**
+   (32-bit xmm). JIT-defined classes call each other and dispatch by name. Tests:
+   `tests/jit{class,field,new}.sh`. **Remaining:** invokevirtual/invokeinterface (vtable
+   dispatch), JIT-side RC bookkeeping so general local `new` doesn't leak, array creation
+   (newarray/anewarray), call-site alignment for AOT SSE targets, and full exception
+   semantics (uncaught propagation, per-pc stack-depth reset, type-narrowed catches).
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
