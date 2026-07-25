@@ -244,6 +244,19 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_deep_copy_arena", "ptr (ptr)"),
     ("jrt_deep_copy_heap", "ptr (ptr)"),
     ("jrt_copymap_put", "void (ptr, ptr, ptr)"),
+    // jdk.internal.misc.Unsafe int/long memory-access layer (native concurrency).
+    ("jrt_unsafe_get_int", "i32 (ptr, i64)"),
+    ("jrt_unsafe_put_int", "void (ptr, i64, i32)"),
+    ("jrt_unsafe_cas_int", "i32 (ptr, i64, i32, i32)"),
+    ("jrt_unsafe_caex_int", "i32 (ptr, i64, i32, i32)"),
+    ("jrt_unsafe_getset_int", "i32 (ptr, i64, i32)"),
+    ("jrt_unsafe_getadd_int", "i32 (ptr, i64, i32)"),
+    ("jrt_unsafe_get_long", "i64 (ptr, i64)"),
+    ("jrt_unsafe_put_long", "void (ptr, i64, i64)"),
+    ("jrt_unsafe_cas_long", "i32 (ptr, i64, i64, i64)"),
+    ("jrt_unsafe_caex_long", "i64 (ptr, i64, i64, i64)"),
+    ("jrt_unsafe_getset_long", "i64 (ptr, i64, i64)"),
+    ("jrt_unsafe_getadd_long", "i64 (ptr, i64, i64)"),
 ];
 
 fn array_vtable(kind: ArrKind) -> &'static str {

@@ -502,6 +502,48 @@ impl Program {
         }
     }
 
+    /// Byte offset of an instance field from the object base, matching the
+    /// backend's LLVM struct layout `{ i64 refcount, ptr vtable, fields… }`
+    /// (default alignment-aware layout; superclass fields precede own fields,
+    /// in declaration order — identical to the backend's `flatten_fields`).
+    /// Field alignment == size for our primitive/ref types on x86-64, so the
+    /// offsets equal LLVM's `getelementptr`/`ptrtoint` values used elsewhere.
+    /// This is the value `sun.misc`/`jdk.internal.misc.Unsafe.objectFieldOffset`
+    /// must return so that `getInt`/`putInt`/`compareAndSetInt` hit real fields.
+    pub fn field_byte_offset(&self, class: &str, field: &str) -> Option<(u64, Ty)> {
+        fn flatten(p: &Program, class: &str, out: &mut Vec<(Ty, String)>) {
+            if let Some(c) = p.class(class) {
+                if let Some(s) = c.super_name.as_deref() {
+                    flatten(p, s, out);
+                }
+                for f in &c.fields {
+                    out.push((f.ty, f.name.clone()));
+                }
+            }
+        }
+        fn sz(t: Ty) -> u64 {
+            match t {
+                Ty::I64 | Ty::F64 | Ty::Ref => 8,
+                Ty::I32 | Ty::F32 => 4,
+                Ty::Void => 0,
+            }
+        }
+        let mut flat = Vec::new();
+        flatten(self, class, &mut flat);
+        let mut off: u64 = 16; // header: i64 refcount @0, ptr vtable @8
+        for (ty, name) in &flat {
+            let a = sz(*ty);
+            if a != 0 {
+                off = off.div_ceil(a) * a; // align up to the field's ABI alignment
+            }
+            if name == field {
+                return Some((off, *ty));
+            }
+            off += a;
+        }
+        None
+    }
+
     /// Resolve a static field (up the superclass chain). Returns
     /// (owner class, type).
     pub fn resolve_static_field(&self, class: &str, field: &str) -> Option<(&str, Ty)> {

@@ -863,6 +863,56 @@ fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) ->
     Origin::Opaque
 }
 
+/// Route a `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe` Object-relative int/long
+/// memory-access method to its runtime helper + result type. Memory-order
+/// variants (Volatile/Acquire/Release/Opaque/Plain, `weak*`) all collapse to the
+/// seq_cst helper — conservative and correct on x86-64. Reference-typed accessors
+/// are intentionally excluded (a ref store needs an RC barrier — separate work);
+/// address-based (non-Object) forms are excluded via the leading-ref check.
+fn unsafe_mem_route(name: &str, desc: &str) -> Option<(&'static str, Ty)> {
+    let (ptys, ret) = parse_descriptor(desc).ok()?;
+    if ptys.first() != Some(&Ty::Ref) {
+        return None; // only the (Object, long, …) family
+    }
+    // Width of the accessed value: return type for plain get*, else last param.
+    let is_long = if name.starts_with("get") && !name.starts_with("getAnd") {
+        ret == Ty::I64
+    } else {
+        ptys.last().copied() == Some(Ty::I64)
+    };
+    let (op, rty) = if name.starts_with("compareAndExchange") {
+        ("caex", if is_long { Ty::I64 } else { Ty::I32 })
+    } else if name.starts_with("compareAndSet") || name.starts_with("weakCompareAndSet") {
+        ("cas", Ty::I32)
+    } else if name.starts_with("getAndAdd") {
+        ("getadd", if is_long { Ty::I64 } else { Ty::I32 })
+    } else if name.starts_with("getAndSet") {
+        ("getset", if is_long { Ty::I64 } else { Ty::I32 })
+    } else if name.starts_with("put") {
+        ("put", Ty::Void)
+    } else if name.starts_with("get") {
+        ("get", if is_long { Ty::I64 } else { Ty::I32 })
+    } else {
+        return None;
+    };
+    let func = match (op, is_long) {
+        ("get", false) => "jrt_unsafe_get_int",
+        ("put", false) => "jrt_unsafe_put_int",
+        ("cas", false) => "jrt_unsafe_cas_int",
+        ("caex", false) => "jrt_unsafe_caex_int",
+        ("getset", false) => "jrt_unsafe_getset_int",
+        ("getadd", false) => "jrt_unsafe_getadd_int",
+        ("get", true) => "jrt_unsafe_get_long",
+        ("put", true) => "jrt_unsafe_put_long",
+        ("cas", true) => "jrt_unsafe_cas_long",
+        ("caex", true) => "jrt_unsafe_caex_long",
+        ("getset", true) => "jrt_unsafe_getset_long",
+        ("getadd", true) => "jrt_unsafe_getadd_long",
+        _ => return None,
+    };
+    Some((func, rty))
+}
+
 struct MethodLowering<'a> {
     cf: &'a ClassFile,
     locals: Vec<Ty>,
@@ -1897,6 +1947,69 @@ fn lower_block(
                     });
                     continue;
                 }
+                // --- jdk.internal.misc.Unsafe / sun.misc.Unsafe: native concurrency ---
+                // objectFieldOffset(Class,String) folds to a compile-time byte offset;
+                // the int/long get/put/CAS/exchange/add families become jrt_unsafe_*
+                // atomic accesses (the receiver — a null from getUnsafe() — is dropped).
+                if class == "jdk/internal/misc/Unsafe" || class == "sun/misc/Unsafe" {
+                    let (uname, udesc) = (name.to_string(), desc.to_string());
+                    if uname == "objectFieldOffset"
+                        && udesc == "(Ljava/lang/Class;Ljava/lang/String;)J"
+                    {
+                        let fname_l = pop!(); // String field name (stack top)
+                        let cls_l = pop!(); // Class
+                        pop!(); // receiver (ignored)
+                        let fname = match origin_of(&stmts, fname_l) {
+                            Origin::Op(Operand::ConstStr(sid)) => {
+                                program.strings.get(*sid as usize).cloned()
+                            }
+                            _ => None,
+                        }
+                        .ok_or_else(|| FrontendError::Unsupported(
+                            "Unsafe.objectFieldOffset with non-constant field name".into(),
+                        ))?;
+                        let cls = ml
+                            .class_const
+                            .get(&cls_l)
+                            .cloned()
+                            .or_else(|| match origin_of(&stmts, cls_l) {
+                                Origin::Op(Operand::ConstClass(c)) => Some(c.clone()),
+                                _ => None,
+                            })
+                            .ok_or_else(|| FrontendError::Unsupported(
+                                "Unsafe.objectFieldOffset with non-constant class".into(),
+                            ))?;
+                        let (off, _) = program.field_byte_offset(&cls, &fname).ok_or_else(|| {
+                            FrontendError::Unsupported(format!(
+                                "Unsafe.objectFieldOffset: unknown field {cls}.{fname}"
+                            ))
+                        })?;
+                        push!(Ty::I64, Rvalue::Use(Operand::ConstI64(off as i64)));
+                        continue;
+                    }
+                    if let Some((func, rty)) = unsafe_mem_route(&uname, &udesc) {
+                        let (ptys, _) = parse_descriptor(&udesc)?;
+                        let mut args = Vec::new();
+                        for _ in &ptys {
+                            args.push(Operand::Copy(pop!()));
+                        }
+                        pop!(); // receiver (ignored)
+                        args.reverse();
+                        let dest = if rty == Ty::Void {
+                            None
+                        } else {
+                            let l = ml.stack_slot(stack.len(), rty);
+                            stack.push(rty);
+                            Some(l)
+                        };
+                        stmts.push(Statement::Call { dest, func: func.to_string(), args });
+                        continue;
+                    }
+                    return Err(FrontendError::Unsupported(format!(
+                        "Unsafe.{uname}{udesc} (supported: objectFieldOffset(Class,String); \
+                         int/long get/put/compareAndSet/compareAndExchange/getAndAdd/getAndSet)"
+                    )));
+                }
                 // System.out.printf(fmt, Object[]) → format + print,
                 // returns the stream (dummy).
                 if class == "java/io/PrintStream"
@@ -2658,6 +2771,15 @@ fn lower_block(
             }
             Instr::InvokeStatic(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;
+                // Unsafe.getUnsafe(): the singleton is only ever a receiver for the
+                // (receiver-ignoring) Unsafe intrinsics, so a null placeholder is
+                // enough. This also keeps the native Unsafe class out of the world.
+                if (class == "jdk/internal/misc/Unsafe" || class == "sun/misc/Unsafe")
+                    && name == "getUnsafe"
+                {
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
+                    continue;
+                }
                 // Reflection: Class.forName with a constant argument is resolved
                 // at compile time — statically known "dynamic" class loading in
                 // the sense of DESIGN.md §1.3.
@@ -2907,6 +3029,8 @@ fn lower_block(
                 let simple: Option<(&str, Ty)> = match (class, name, desc) {
                     ("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I") => Some(("jrt_parse_int", Ty::I32)),
                     ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => Some(("jrt_parse_long", Ty::I64)),
+                    ("java/lang/Integer", "toString", "(I)Ljava/lang/String;") => Some(("jrt_int_to_str", Ty::Ref)),
+                    ("java/lang/Long", "toString", "(J)Ljava/lang/String;") => Some(("jrt_long_to_str", Ty::Ref)),
                     ("java/lang/Math", "abs", "(I)I") => Some(("jrt_math_abs_i", Ty::I32)),
                     ("java/lang/Math", "abs", "(J)J") => Some(("jrt_math_abs_l", Ty::I64)),
                     ("java/lang/Math", "abs", "(D)D") => Some(("jrt_math_abs_d", Ty::F64)),

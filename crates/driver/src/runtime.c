@@ -4633,3 +4633,56 @@ void jrt_println_long(int64_t v) { jrt_print_long(v); plat_write("\n", 1); }
 /* %g approximation; not Java's shortest round-trip-safe format (DESIGN.md §6). */
 void jrt_print_double(double d) { char b[40]; plat_write(b, (size_t)fmt_g(b, d)); }
 void jrt_println_double(double d) { jrt_print_double(d); plat_write("\n", 1); }
+
+/* --- jdk.internal.misc.Unsafe / sun.misc.Unsafe: native concurrency layer ---
+ * The compiler lowers Unsafe.getUnsafe() to a null receiver and
+ * objectFieldOffset(Class,String) to a compile-time byte offset (Program::
+ * field_byte_offset, identical to the backend's LLVM field layout). These
+ * helpers perform the actual atomic access at (char*)obj + off. Memory-order
+ * variants (Volatile/Acquire/Release/Opaque/Plain, weak*) all lower here to
+ * seq_cst — conservative and correct on x86-64 (TSO). The `off` is a real byte
+ * offset into the object, so int fields must be 4-byte aligned and long fields
+ * 8-byte aligned, which the layout guarantees. */
+int32_t jrt_unsafe_get_int(void *obj, int64_t off) {
+    return __atomic_load_n((int32_t *)((char *)obj + off), __ATOMIC_SEQ_CST);
+}
+void jrt_unsafe_put_int(void *obj, int64_t off, int32_t v) {
+    __atomic_store_n((int32_t *)((char *)obj + off), v, __ATOMIC_SEQ_CST);
+}
+int32_t jrt_unsafe_cas_int(void *obj, int64_t off, int32_t expect, int32_t x) {
+    return __atomic_compare_exchange_n((int32_t *)((char *)obj + off), &expect, x,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
+/* compareAndExchange: returns the witness (pre-CAS content), not a boolean. */
+int32_t jrt_unsafe_caex_int(void *obj, int64_t off, int32_t expect, int32_t x) {
+    __atomic_compare_exchange_n((int32_t *)((char *)obj + off), &expect, x, 0,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expect;
+}
+int32_t jrt_unsafe_getset_int(void *obj, int64_t off, int32_t v) {
+    return __atomic_exchange_n((int32_t *)((char *)obj + off), v, __ATOMIC_SEQ_CST);
+}
+int32_t jrt_unsafe_getadd_int(void *obj, int64_t off, int32_t delta) {
+    return __atomic_fetch_add((int32_t *)((char *)obj + off), delta, __ATOMIC_SEQ_CST);
+}
+int64_t jrt_unsafe_get_long(void *obj, int64_t off) {
+    return __atomic_load_n((int64_t *)((char *)obj + off), __ATOMIC_SEQ_CST);
+}
+void jrt_unsafe_put_long(void *obj, int64_t off, int64_t v) {
+    __atomic_store_n((int64_t *)((char *)obj + off), v, __ATOMIC_SEQ_CST);
+}
+int32_t jrt_unsafe_cas_long(void *obj, int64_t off, int64_t expect, int64_t x) {
+    return __atomic_compare_exchange_n((int64_t *)((char *)obj + off), &expect, x,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
+int64_t jrt_unsafe_caex_long(void *obj, int64_t off, int64_t expect, int64_t x) {
+    __atomic_compare_exchange_n((int64_t *)((char *)obj + off), &expect, x, 0,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expect;
+}
+int64_t jrt_unsafe_getset_long(void *obj, int64_t off, int64_t v) {
+    return __atomic_exchange_n((int64_t *)((char *)obj + off), v, __ATOMIC_SEQ_CST);
+}
+int64_t jrt_unsafe_getadd_long(void *obj, int64_t off, int64_t delta) {
+    return __atomic_fetch_add((int64_t *)((char *)obj + off), delta, __ATOMIC_SEQ_CST);
+}
