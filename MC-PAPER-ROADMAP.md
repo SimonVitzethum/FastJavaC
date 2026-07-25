@@ -96,6 +96,16 @@ parallel execution model — it only edits native code that the CPU runs directl
 
 ## 3. The JDK: compile OpenJDK + build the native layer
 
+> **Status (2026-07-25): native layer STARTED.** The `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe`
+> **int/long CAS + memory family** is implemented against fastjavac's object model
+> (`Program::field_byte_offset` gives `objectFieldOffset` a layout-exact byte offset; the
+> get/put/compareAndSet/exchange/getAndAdd/getAndSet ops lower to `jrt_unsafe_*` `__atomic_*`
+> accesses). Real OpenJDK `java.util.concurrent.atomic.AtomicInteger`/`AtomicLong` now
+> compile+run+heap-balance through fastjavac — the first real JDK classes with native methods
+> running end-to-end. Remaining native backlog below; nearest next items: ref-typed Unsafe
+> accessors (need an RC store barrier, for `AtomicReference`), `arrayBaseOffset`/`arrayIndexScale`,
+> then `Object`/`System`/`Class` core natives.
+
 - **Compile the pure-Java OpenJDK classes** (from `jmods`/`src`) with fastjavac. Most of
   `java.util`, `java.io`, `java.nio`, `java.util.stream`, `java.util.concurrent` is pure
   Java and should compile once the language/bytecode coverage is complete.
