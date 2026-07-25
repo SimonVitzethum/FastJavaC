@@ -783,7 +783,24 @@ fn descriptor_params(desc: &str) -> Result<Vec<String>> {
                 }
             }
             '[' => {
-                return Err(FrontendError::Unsupported(format!("array argument in {desc}")));
+                // Array type: any number of '[' then a component (primitive or
+                // L…;). One parameter of reference kind.
+                while chars.peek() == Some(&'[') {
+                    s.push(chars.next().unwrap());
+                }
+                match chars.next() {
+                    Some('L') => {
+                        s.push('L');
+                        for c2 in chars.by_ref() {
+                            s.push(c2);
+                            if c2 == ';' {
+                                break;
+                            }
+                        }
+                    }
+                    Some(p) => s.push(p),
+                    None => return Err(FrontendError::Unsupported(format!("bad array descriptor {desc}"))),
+                }
             }
             _ => {}
         }
@@ -1933,14 +1950,6 @@ fn lower_block(
                     stack.push(Ty::Ref);
                     continue;
                 }
-                // java.io file streams are runtime-backed JObjs holding an fd:
-                // new → jrt_stream_new (the <init> opens the file, see invokespecial).
-                if class == "java/io/FileInputStream" || class == "java/io/FileOutputStream" {
-                    let l = ml.stack_slot(stack.len(), Ty::Ref);
-                    stmts.push(Statement::Call { dest: Some(l), func: "jrt_stream_new".to_string(), args: vec![] });
-                    stack.push(Ty::Ref);
-                    continue;
-                }
                 if program.class(&class).is_none() {
                     return Err(FrontendError::Unsupported(format!("new {class} (class not in the closed-world input)")));
                 }
@@ -2000,33 +2009,6 @@ fn lower_block(
                         });
                     }
                     continue;
-                }
-                // File-stream constructors open the file (the object came from
-                // jrt_stream_new). args = [receiver, path(, append)].
-                if (class == "java/io/FileInputStream" || class == "java/io/FileOutputStream")
-                    && name == "<init>"
-                {
-                    // A failed open throws a catchable IOException (via the runtime),
-                    // so mark the constructor site as a throwing point.
-                    if class == "java/io/FileInputStream" && desc == "(Ljava/lang/String;)V" {
-                        stmts.push(Statement::Call { dest: None, func: "jrt_fis_open".into(), args });
-                        throw_after = Some(*pc);
-                        continue;
-                    }
-                    if class == "java/io/FileOutputStream" && desc == "(Ljava/lang/String;)V" {
-                        args.push(Operand::ConstI32(0)); // append = false
-                        stmts.push(Statement::Call { dest: None, func: "jrt_fos_open".into(), args });
-                        throw_after = Some(*pc);
-                        continue;
-                    }
-                    if class == "java/io/FileOutputStream" && desc == "(Ljava/lang/String;Z)V" {
-                        stmts.push(Statement::Call { dest: None, func: "jrt_fos_open".into(), args });
-                        throw_after = Some(*pc);
-                        continue;
-                    }
-                    return Err(FrontendError::Unsupported(format!(
-                        "{class}.<init>{desc} (supported: (String), FileOutputStream also (String,boolean))"
-                    )));
                 }
                 if name == "<init>" && program.class(&class).is_none() {
                     // Constructor of a non-modelled base class
@@ -2288,56 +2270,6 @@ fn lower_block(
                     let f = if name == "println" { "jrt_println_str" } else { "jrt_print_str" };
                     stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(s)] });
                     continue;
-                }
-                // java.io file-stream methods (runtime-backed over syscalls). The
-                // receiver is the JFileStream from jrt_stream_new regardless of the
-                // static type (concrete or the abstract InputStream/OutputStream).
-                if matches!(
-                    class,
-                    "java/io/FileInputStream"
-                        | "java/io/FileOutputStream"
-                        | "java/io/InputStream"
-                        | "java/io/OutputStream"
-                ) {
-                    // (func, ret type, arg count excluding receiver)
-                    let route: Option<(&str, Ty, usize)> = match (name, desc) {
-                        ("read", "()I") => Some(("jrt_fis_read", Ty::I32, 0)),
-                        ("read", "([B)I") => Some(("jrt_fis_read_bytes", Ty::I32, 1)),
-                        ("read", "([BII)I") => Some(("jrt_fis_read_region", Ty::I32, 3)),
-                        ("write", "(I)V") => Some(("jrt_fos_write", Ty::Void, 1)),
-                        ("write", "([B)V") => Some(("jrt_fos_write_bytes", Ty::Void, 1)),
-                        ("write", "([BII)V") => Some(("jrt_fos_write_region", Ty::Void, 3)),
-                        ("close", "()V") => Some(("jrt_stream_close", Ty::Void, 0)),
-                        ("flush", "()V") => Some(("__noop", Ty::Void, 0)), // unbuffered
-                        _ => None,
-                    };
-                    if let Some((func, rty, nargs)) = route {
-                        let mut args = Vec::new();
-                        for _ in 0..nargs {
-                            args.push(Operand::Copy(pop!()));
-                        }
-                        let recv = pop!();
-                        args.push(Operand::Copy(recv));
-                        args.reverse(); // [receiver, arg1, …]
-                        if func != "__noop" {
-                            let dest = if rty == Ty::Void {
-                                None
-                            } else {
-                                let l = ml.stack_slot(stack.len(), rty);
-                                stack.push(rty);
-                                Some(l)
-                            };
-                            stmts.push(Statement::Call { dest, func: func.to_string(), args });
-                        }
-                        // read/write on a bad fd return -1/no-op rather than throwing;
-                        // NPE on a null receiver is still possible.
-                        throw_after = Some(*pc);
-                        continue;
-                    }
-                    return Err(FrontendError::Unsupported(format!(
-                        "{class}.{name}{desc} (file-stream subset: read()/read([B)/read([BII), \
-                         write(I)/write([B)/write([BII), close, flush)"
-                    )));
                 }
                 // StringBuilder methods (runtime-backed). append returns this
                 // (chaining), toString a new string.
@@ -3303,6 +3235,12 @@ fn lower_block(
                 if name.starts_with("__fjc_") {
                     // (jrt function, argument count). The return type is derived from
                     // the descriptor (I/Z/B/C/S -> int, J -> long, L../[.. -> reference).
+                    // General convention (below): any unlisted `__fjc_<suffix>`
+                    // binds to `jrt_<suffix>` with arg count + return type derived
+                    // from the descriptor. This lets a Java stdlib stub reach a new
+                    // native leaf by name alone — no per-method Rust entry, and the
+                    // backend auto-declares the callee from the call site's types.
+                    let general_name: String;
                     let (func, nargs): (&str, usize) = match (name, desc) {
                         ("__fjc_field_count", "(Ljava/lang/String;)I") => ("jrt_fjc_field_count", 1),
                         ("__fjc_method_count", "(Ljava/lang/String;)I") => ("jrt_fjc_method_count", 1),
@@ -3343,7 +3281,10 @@ fn lower_block(
                         ("__fjc_call_f", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;F)F") => ("jrt_call_float", 4),
                         // Factory call: no-arg method returning a freshly-created object (no extra retain):
                         ("__fjc_call_new", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;") => ("jrt_call_new", 3),
-                        _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
+                        _ => {
+                            general_name = format!("jrt_{}", &name["__fjc_".len()..]);
+                            (general_name.as_str(), descriptor_params(desc)?.len())
+                        }
                     };
                     let mut args: Vec<Operand> = Vec::new();
                     for _ in 0..nargs {

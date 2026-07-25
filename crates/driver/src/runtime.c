@@ -328,7 +328,6 @@ void *jrt_noop_copy(void *src, void *map); /* deep-copy vtable slot-3 stub */
 void *jrt_alloc(int64_t size);
 void jrt_retain(void *p);
 void jrt_throw_npe(void);
-void jrt_throw_ioexception(void);
 void jrt_throw_bounds(void);
 _Noreturn void jrt_throw_bounds_fatal(void);
 void jrt_throw_sioobe(void);
@@ -2274,7 +2273,6 @@ void *jrt_sentinel_vtable[4] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, N
 static JObjHeader arith_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader npe_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader bounds_exc_obj = {-1, jrt_sentinel_vtable};
-static JObjHeader io_exc_obj = {-1, jrt_sentinel_vtable};
 
 /* --- Debug backtraces (--backtrace, off by default) --------------------------
  * Capture a native backtrace at the THROW ORIGIN (where the stack still holds the
@@ -2330,11 +2328,6 @@ void jrt_throw_bounds(void) {
 }
 void jrt_throw_sioobe(void) {
     throw_runtime(&bounds_exc_obj, "java.lang.StringIndexOutOfBoundsException");
-}
-/* Catchable IOException (file open/…): catch-all against the sentinel, so a Java
- * catch(IOException)/catch(Exception) grabs it; uncaught → reported and aborts. */
-void jrt_throw_ioexception(void) {
-    throw_runtime(&io_exc_obj, "java.io.IOException");
 }
 
 /* Fatal (noreturn) variants: when the whole program provably has NO handler that
@@ -3374,99 +3367,56 @@ int32_t jrt_read_into(const void *arr, const void *path_j) {
     return (int32_t)got;
 }
 
-/* --- java.io file streams: FileInputStream / FileOutputStream over real
- * open/read/write/close syscalls. The stream is a runtime-backed JObj holding an
- * fd; its drop closes the fd (idempotent), so a dropped-but-unclosed stream does
- * not leak the descriptor. A failed open leaves fd = -1; subsequent reads report
- * EOF and writes are dropped (IOException/FileNotFoundException are not modelled
- * yet — a documented limitation of this first slice). */
-typedef struct {
-    int64_t refcount;
-    void *vtable;
-    int64_t fd;
-} JFileStream;
-static void jrt_stream_drop(void *p) {
-    JFileStream *s = (JFileStream *)p;
-    if (s->fd >= 0) { close((int)s->fd); s->fd = -1; }
-}
-void (*jrt_stream_vtable[4])(void) = {
-    (void (*)(void))jrt_stream_drop,
-    (void (*)(void))jrt_noop_trace,
-    (void (*)(void))0, /* no type descriptor */
-    (void (*)(void))jrt_noop_copy,
-};
-void *jrt_stream_new(void) {
-    JFileStream *s = (JFileStream *)jrt_alloc((int64_t)sizeof(JFileStream));
-    s->vtable = (void *)jrt_stream_vtable;
-    s->fd = -1;
-    return s;
-}
-void jrt_fis_open(void *stream, const void *path_j) {
-    JFileStream *s = (JFileStream *)stream;
+/* --- fd-based I/O leaves: the GENERAL native layer the java.io Java stubs (in
+ * stdlib/java/io/) bottom out in. The stubs hold the fd as an int field and call
+ * these by the __fjc_<name> → jrt_<name> convention; open failure returns -1 and
+ * the stub throws java.io.IOException (no per-class Rust code). Bounds-checked
+ * byte[] regions (length @+16, data @+32). */
+int32_t jrt_io_open_read(const void *path_j) {
     char path[4096];
     jstr_to_cstr(path_j, path, sizeof path);
-    int fd = path[0] ? open(path, O_RDONLY) : -1;
-    if (fd >= 0) { s->fd = fd; return; }
-    jrt_throw_ioexception(); /* FileNotFoundException in Java; caught as IOException */
+    return path[0] ? open(path, O_RDONLY) : -1;
 }
-void jrt_fos_open(void *stream, const void *path_j, int32_t append) {
-    JFileStream *s = (JFileStream *)stream;
+int32_t jrt_io_open_write(const void *path_j, int32_t append) {
     char path[4096];
     jstr_to_cstr(path_j, path, sizeof path);
-    int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-    int fd = path[0] ? open(path, flags, 0644) : -1;
-    if (fd >= 0) { s->fd = fd; return; }
-    jrt_throw_ioexception();
+    if (!path[0]) return -1;
+    return open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
 }
-/* read one byte: 0..255, or -1 at EOF/error (Java InputStream.read()). */
-int32_t jrt_fis_read(void *stream) {
-    JFileStream *s = (JFileStream *)stream;
-    if (!s || s->fd < 0) return -1;
+int32_t jrt_io_read1(int32_t fd) {
+    if (fd < 0) return -1;
     uint8_t b;
-    ssize_t n = read((int)s->fd, &b, 1);
+    ssize_t n = read(fd, &b, 1);
     return (n == 1) ? (int32_t)b : -1;
 }
-int32_t jrt_fis_read_region(void *stream, void *arr, int32_t off, int32_t len) {
-    JFileStream *s = (JFileStream *)stream;
-    if (!s || s->fd < 0 || !arr) return -1;
+int32_t jrt_io_readb(int32_t fd, const void *arr, int32_t off, int32_t len) {
+    if (fd < 0 || !arr) return -1;
     if (len <= 0) return 0;
     int64_t cap = JARR_LEN(arr);
     if (off < 0 || (int64_t)off + len > cap) return -1;
-    uint8_t *data = (uint8_t *)((char *)arr + 32) + off;
-    ssize_t n = read((int)s->fd, data, (size_t)len);
-    return (n > 0) ? (int32_t)n : -1; /* 0 bytes → EOF → -1 for a nonzero request */
+    ssize_t n = read(fd, (uint8_t *)((char *)arr + 32) + off, (size_t)len);
+    return (n > 0) ? (int32_t)n : -1;
 }
-int32_t jrt_fis_read_bytes(void *stream, void *arr) {
-    if (!arr) return -1;
-    return jrt_fis_read_region(stream, arr, 0, (int32_t)JARR_LEN(arr));
-}
-void jrt_fos_write(void *stream, int32_t b) {
-    JFileStream *s = (JFileStream *)stream;
-    if (!s || s->fd < 0) return;
-    uint8_t byte = (uint8_t)b;
-    ssize_t r = write((int)s->fd, &byte, 1);
+void jrt_io_write1(int32_t fd, int32_t b) {
+    if (fd < 0) return;
+    uint8_t x = (uint8_t)b;
+    ssize_t r = write(fd, &x, 1);
     (void)r;
 }
-void jrt_fos_write_region(void *stream, void *arr, int32_t off, int32_t len) {
-    JFileStream *s = (JFileStream *)stream;
-    if (!s || s->fd < 0 || !arr || len < 0) return;
+void jrt_io_writeb(int32_t fd, const void *arr, int32_t off, int32_t len) {
+    if (fd < 0 || !arr || len < 0) return;
     int64_t cap = JARR_LEN(arr);
     if (off < 0 || (int64_t)off + len > cap) return;
-    const uint8_t *data = (const uint8_t *)((const char *)arr + 32) + off;
-    int32_t total = 0;
-    while (total < len) {
-        ssize_t n = write((int)s->fd, data + total, (size_t)(len - total));
+    const uint8_t *d = (const uint8_t *)((const char *)arr + 32) + off;
+    int32_t t = 0;
+    while (t < len) {
+        ssize_t n = write(fd, d + t, (size_t)(len - t));
         if (n <= 0) return;
-        total += (int32_t)n;
+        t += (int32_t)n;
     }
 }
-void jrt_fos_write_bytes(void *stream, void *arr) {
-    if (!arr) return;
-    jrt_fos_write_region(stream, arr, 0, (int32_t)JARR_LEN(arr));
-}
-void jrt_stream_close(void *stream) {
-    JFileStream *s = (JFileStream *)stream;
-    if (s && s->fd >= 0) { close((int)s->fd); s->fd = -1; }
+void jrt_io_close(int32_t fd) {
+    if (fd >= 0) close(fd);
 }
 
 /* defineClass primitive: JIT a RAW method-bytecode blob that lives only in memory —
@@ -3759,16 +3709,13 @@ int32_t jrt_define_and_run(const void *a, const void *b, const void *c, int32_t 
 }
 int32_t jrt_file_size(const void *a) { (void)a; return -100; }
 int32_t jrt_read_into(const void *a, const void *b) { (void)a; (void)b; return -100; }
-void *jrt_stream_new(void) { return (void *)0; }
-void jrt_fis_open(void *a, const void *b) { (void)a; (void)b; }
-void jrt_fos_open(void *a, const void *b, int32_t c) { (void)a; (void)b; (void)c; }
-int32_t jrt_fis_read(void *a) { (void)a; return -1; }
-int32_t jrt_fis_read_region(void *a, void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -1; }
-int32_t jrt_fis_read_bytes(void *a, void *b) { (void)a; (void)b; return -1; }
-void jrt_fos_write(void *a, int32_t b) { (void)a; (void)b; }
-void jrt_fos_write_region(void *a, void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; }
-void jrt_fos_write_bytes(void *a, void *b) { (void)a; (void)b; }
-void jrt_stream_close(void *a) { (void)a; }
+int32_t jrt_io_open_read(const void *a) { (void)a; return -1; }
+int32_t jrt_io_open_write(const void *a, int32_t b) { (void)a; (void)b; return -1; }
+int32_t jrt_io_read1(int32_t a) { (void)a; return -1; }
+int32_t jrt_io_readb(int32_t a, const void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -1; }
+void jrt_io_write1(int32_t a, int32_t b) { (void)a; (void)b; }
+void jrt_io_writeb(int32_t a, const void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; }
+void jrt_io_close(int32_t a) { (void)a; }
 int32_t jrt_define_class_jit(const void *a) { (void)a; return -100; }
 int64_t jrt_call_static(const void *a, const void *b, const void *c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -100; }
 int32_t jrt_call_static_obj1(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return -100; }

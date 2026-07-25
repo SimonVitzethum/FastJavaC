@@ -262,17 +262,6 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_unsafe_getset_ref", "ptr (ptr, i64, ptr)"),
     ("jrt_unsafe_cas_ref", "i32 (ptr, i64, ptr, ptr)"),
     ("jrt_unsafe_caex_ref", "ptr (ptr, i64, ptr, ptr)"),
-    // java.io file streams (FileInputStream/FileOutputStream over syscalls).
-    ("jrt_stream_new", "ptr ()"),
-    ("jrt_fis_open", "void (ptr, ptr)"),
-    ("jrt_fos_open", "void (ptr, ptr, i32)"),
-    ("jrt_fis_read", "i32 (ptr)"),
-    ("jrt_fis_read_region", "i32 (ptr, ptr, i32, i32)"),
-    ("jrt_fis_read_bytes", "i32 (ptr, ptr)"),
-    ("jrt_fos_write", "void (ptr, i32)"),
-    ("jrt_fos_write_region", "void (ptr, ptr, i32, i32)"),
-    ("jrt_fos_write_bytes", "void (ptr, ptr)"),
-    ("jrt_stream_close", "void (ptr)"),
 ];
 
 fn array_vtable(kind: ArrKind) -> &'static str {

@@ -9,7 +9,7 @@ set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
 ex="$root/examples"
 fastjavac="$root/target/debug/fastjavac"
-stdlib="$root/stdlib/out/java/util/*.class $root/stdlib/out/java/util/function/*.class $root/stdlib/out/java/util/stream/*.class"
+stdlib="$root/stdlib/out/java/util/*.class $root/stdlib/out/java/util/function/*.class $root/stdlib/out/java/util/stream/*.class $root/stdlib/out/java/io/*.class"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
