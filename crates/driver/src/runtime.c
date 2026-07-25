@@ -2699,9 +2699,12 @@ static void jeN(const void *p, int n) { memcpy(JIT_CODE + JIT_LEN, p, (size_t)n)
 static void je_i32(int32_t v) { jeN(&v, 4); }
 static void je_i64(int64_t v) { jeN(&v, 8); }
 static void je_push_imm64(int64_t v) { je1(0x48); je1(0xB8); je_i64(v); je1(0x50); } /* mov rax,imm64; push rax */
-static void je_push_local(int i) { je1(0xFF); je1(0x77); je1((unsigned char)(8 * i)); }
-static void je_pop_local(int i) { je1(0x8F); je1(0x47); je1((unsigned char)(8 * i)); }
+/* Locals base is RBX (callee-saved), so C calls from JITted code (RC helpers) preserve it.
+ * push [rbx+disp8] = FF 73 disp8 ; pop [rbx+disp8] = 8F 43 disp8. */
+static void je_push_local(int i) { je1(0xFF); je1(0x73); je1((unsigned char)(8 * i)); }
+static void je_pop_local(int i) { je1(0x8F); je1(0x43); je1((unsigned char)(8 * i)); }
 static void je_push_imm(int32_t v) { je1(0x68); je_i32(v); }
+static void je_ret(void) { je1(0x5D); je1(0x5B); je1(0xC3); } /* epilogue: pop rbp; pop rbx; ret */
 static void je_jcc(unsigned char cc, int tpc) { je1(0x0F); je1(cc); JIT_FIX[JIT_NFIX].off = JIT_LEN; JIT_FIX[JIT_NFIX].target_pc = tpc; JIT_NFIX++; je_i32(0); }
 static void je_jmp(int tpc) { je1(0xE9); JIT_FIX[JIT_NFIX].off = JIT_LEN; JIT_FIX[JIT_NFIX].target_pc = tpc; JIT_NFIX++; je_i32(0); }
 static int16_t je_s16(const uint8_t *b) { return (int16_t)((b[0] << 8) | b[1]); }
@@ -2797,15 +2800,72 @@ static const FjcClass *jit_resolve_class(const CpInfo *cp, int cref) {
     return jrt_class_by_name(dotted);
 }
 
+/* Net operand-stack effect of an opcode, for RC ownership tracking. Only `new` produces
+ * an *owned* reference (+1 the JITted body must release); everything else is borrowed. */
+static void jvm_delta(uint8_t op, const uint8_t *bc, int pc, const CpInfo *cp, int *pops, int *pushes, int *owned) {
+    *pops = 0; *pushes = 0; *owned = 0;
+    switch (op) {
+        case 0x01: case 0x02: case 0x03 ... 0x08: case 0x09: case 0x0a: case 0x0b ... 0x0d:
+        case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x15 ... 0x19: case 0x1a ... 0x2d:
+        case 0x59: *pushes = 1; break;                                   /* consts/loads/dup */
+        case 0xbb: *pushes = 1; *owned = 1; break;                       /* new -> owned */
+        case 0x36 ... 0x4e: case 0x57: *pops = 1; break;                 /* stores / pop */
+        case 0x60: case 0x61: case 0x63 ... 0x65: case 0x67 ... 0x69: case 0x6b: case 0x6f:
+            *pops = 2; *pushes = 1; break;                               /* binary arith */
+        case 0x74: case 0x85 ... 0x8e: case 0xb4: case 0xc0: *pops = 1; *pushes = 1; break; /* unary/conv/getfield/checkcast */
+        case 0xb5: *pops = 2; break;                                     /* putfield */
+        case 0x99 ... 0x9e: case 0xc6: case 0xc7: case 0xac ... 0xb0: case 0xbf:
+            *pops = 1; break;                                           /* if<0>/returns-value/athrow */
+        case 0x9f ... 0xa6: *pops = 2; break;                           /* if_icmp/if_acmp */
+        case 0x84: case 0xa7: case 0xb1: break;                         /* iinc/goto/return */
+        case 0xb6: case 0xb7: case 0xb8: case 0xb9: {                   /* invoke */
+            char d[256]; d[0] = '\0';
+            jit_resolve_method(cp, (bc[pc + 1] << 8) | bc[pc + 2], d, sizeof d);
+            int vr = 0, ka = d[0] ? jit_arg_count(d, &vr) : 0;
+            *pops = ka + (op == 0xb8 ? 0 : 1);
+            *pushes = vr ? 0 : 1;
+            break;
+        }
+        default: break;
+    }
+}
+
+/* Emit release() calls for each ref-owning local (RC at method exit). Uses RBX (locals
+ * base, preserved across C calls) and RBP for 16-byte alignment; saves the int/long return
+ * value in RAX across the calls when has_rax. No-op if no local owns a reference. */
+static void emit_release_ref_locals(const unsigned char *lown, int has_rax) {
+    int any = 0; for (int i = 0; i < 64; i++) if (lown[i]) { any = 1; break; }
+    if (!any) return;
+    if (has_rax) je1(0x50);                            /* push rax */
+    for (int i = 0; i < 64; i++) {
+        if (!lown[i]) continue;
+        jeN("\x48\x89\xE5", 3);                        /* mov rbp, rsp */
+        jeN("\x48\x83\xE4\xF0", 4);                    /* and rsp, -16 */
+        jeN("\x48\x8B\xBB", 3); je_i32(8 * i);         /* mov rdi, [rbx + 8i] */
+        je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)&jrt_release); /* mov rax, &jrt_release */
+        jeN("\xFF\xD0", 2);                            /* call rax */
+        jeN("\x48\x89\xEC", 3);                        /* mov rsp, rbp */
+    }
+    if (has_rax) je1(0x58);                            /* pop rax */
+}
+
 static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc, const CpInfo *cp) {
     if (n <= 0 || n >= (1 << 16)) return NULL;
+    unsigned char lown[64]; memset(lown, 0, sizeof lown); /* local owns a reference (from new) */
+    unsigned char cown[512]; memset(cown, 0, sizeof cown); /* operand-slot owns a reference */
+    int csp = 0;                                          /* compile-time operand depth */
     JIT_LEN = 0; JIT_NFIX = 0;
     for (int i = 0; i <= n; i++) JIT_NOFF[i] = -1;
+    /* Prologue: save rbx+rbp (the pair keeps 16-byte call alignment) and put the locals
+     * base (arg0, RDI) into RBX so it survives C calls made from the JITted body. */
+    je1(0x53); je1(0x55);            /* push rbx; push rbp */
+    jeN("\x48\x89\xFB", 3);          /* mov rbx, rdi */
     static const unsigned char CC[] = {0x84, 0x85, 0x8C, 0x8D, 0x8F, 0x8E}; /* eq ne lt ge gt le */
     int pc = 0;
     while (pc < n) {
         JIT_NOFF[pc] = JIT_LEN;
         uint8_t op = bc[pc];
+        int pc0 = pc;
         switch (op) {
             case 0x02: je_push_imm(-1); pc++; break;
             case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: je_push_imm(op - 0x03); pc++; break;
@@ -2819,7 +2879,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x64: je1(0x58); jeN("\x29\x04\x24", 3); pc++; break;               /* isub */
             case 0x68: je1(0x58); jeN("\x0F\xAF\x04\x24", 4); jeN("\x89\x04\x24", 3); pc++; break; /* imul */
             case 0x74: jeN("\xF7\x1C\x24", 3); pc++; break;                          /* ineg */
-            case 0x84: { int idx = bc[pc + 1]; int32_t c = (int8_t)bc[pc + 2]; je1(0x81); je1(0x47); je1((unsigned char)(8 * idx)); je_i32(c); pc += 3; break; } /* iinc */
+            case 0x84: { int idx = bc[pc + 1]; int32_t c = (int8_t)bc[pc + 2]; je1(0x81); je1(0x43); je1((unsigned char)(8 * idx)); je_i32(c); pc += 3; break; } /* iinc */
             case 0x59: jeN("\xFF\x34\x24", 3); pc++; break;                          /* dup */
             case 0x57: jeN("\x48\x83\xC4\x08", 4); pc++; break;                      /* pop */
             case 0xa7: je_jmp(pc + je_s16(bc + pc + 1)); pc += 3; break;             /* goto */
@@ -2827,15 +2887,15 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 je1(0x58); jeN("\x85\xC0", 2); je_jcc(CC[op - 0x99], pc + je_s16(bc + pc + 1)); pc += 3; break;
             case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:        /* if_icmp<cond> */
                 je1(0x58); je1(0x59); jeN("\x39\xC1", 2); je_jcc(CC[op - 0x9f], pc + je_s16(bc + pc + 1)); pc += 3; break;
-            case 0xac: je1(0x58); je1(0xC3); pc++; break;                            /* ireturn */
-            case 0xb1: je1(0xC3); pc++; break;                                       /* return (void) */
+            case 0xac: je1(0x58); emit_release_ref_locals(lown, 1); je_ret(); pc++; break;                            /* ireturn */
+            case 0xb1: emit_release_ref_locals(lown, 0); je_ret(); pc++; break;                                       /* return (void) */
             /* --- references (opaque 64-bit pointers; fit the same 64-bit slots) --- */
             case 0x01: je_push_imm(0); pc++; break;                                  /* aconst_null */
             case 0x19: je_push_local(bc[pc + 1]); pc += 2; break;                    /* aload */
             case 0x2a: case 0x2b: case 0x2c: case 0x2d: je_push_local(op - 0x2a); pc++; break; /* aload_0..3 */
             case 0x3a: je_pop_local(bc[pc + 1]); pc += 2; break;                     /* astore */
             case 0x4b: case 0x4c: case 0x4d: case 0x4e: je_pop_local(op - 0x4b); pc++; break;  /* astore_0..3 */
-            case 0xb0: je1(0x58); je1(0xC3); pc++; break;                            /* areturn */
+            case 0xb0: je1(0x58); je_ret(); pc++; break;                            /* areturn */
             case 0xa5: case 0xa6:                                                    /* if_acmpeq/ne (64-bit) */
                 je1(0x58); je1(0x59); jeN("\x48\x39\xC1", 3);
                 je_jcc(op == 0xa5 ? 0x84 : 0x85, pc + je_s16(bc + pc + 1)); pc += 3; break;
@@ -2852,7 +2912,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x61: je1(0x58); jeN("\x48\x01\x04\x24", 4); pc++; break;           /* ladd (64-bit) */
             case 0x65: je1(0x58); jeN("\x48\x29\x04\x24", 4); pc++; break;           /* lsub (64-bit) */
             case 0x69: je1(0x58); jeN("\x48\x0F\xAF\x04\x24", 5); jeN("\x48\x89\x04\x24", 4); pc++; break; /* lmul */
-            case 0xad: je1(0x58); je1(0xC3); pc++; break;                            /* lreturn */
+            case 0xad: je1(0x58); emit_release_ref_locals(lown, 1); je_ret(); pc++; break;                            /* lreturn */
             case 0x85: je1(0x58); jeN("\x48\x63\xC0", 3); je1(0x50); pc++; break;    /* i2l: movsxd rax,eax */
             case 0x88: pc++; break;                                                 /* l2i: no-op (int ops use low 32) */
             /* --- doubles (64-bit slots holding the bit pattern; arithmetic via xmm) --- */
@@ -2872,7 +2932,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 jeN("\x66\x0F\xD6\x04\x24", 5); /* movq [rsp], xmm0 */
                 pc++; break;
             }
-            case 0xaf: jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je1(0xC3); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
+            case 0xaf: jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je_ret(); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
             case 0x87: je1(0x58); jeN("\xF2\x0F\x2A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* i2d: cvtsi2sd xmm0,eax; movq rax,xmm0; push */
             case 0x8e: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* d2i: movq xmm0,rax; cvttsd2si eax,xmm0; push */
             /* --- floats (32-bit; low 32 of a slot holds the bits; arithmetic via xmm ss) --- */
@@ -2892,7 +2952,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 jeN("\x66\x0F\x7E\x04\x24", 5); /* movd [rsp], xmm0 */
                 pc++; break;
             }
-            case 0xae: jeN("\x66\x0F\x6E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je1(0xC3); pc++; break; /* freturn: movd xmm0,[rsp]; add rsp,8; ret */
+            case 0xae: jeN("\x66\x0F\x6E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je_ret(); pc++; break; /* freturn: movd xmm0,[rsp]; add rsp,8; ret */
             case 0x86: je1(0x58); jeN("\xF3\x0F\x2A\xC0", 4); jeN("\x66\x0F\x7E\xC0", 4); je1(0x50); pc++; break; /* i2f */
             case 0x8b: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* f2i */
             case 0x8d: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x0F\x5A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* f2d */
@@ -3002,6 +3062,22 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 pc += (op == 0xb9) ? 5 : 3; break;                /* invokeinterface has 2 extra operand bytes */
             }
             default: return NULL; /* unsupported opcode */
+        }
+        /* --- RC ownership tracking (Blocker 1) --- */
+        if (op == 0x3a || (op >= 0x4b && op <= 0x4e)) {            /* astore (ref): local owns iff top was owned */
+            int idx = (op == 0x3a) ? bc[pc0 + 1] : (op - 0x4b);
+            if (idx < 64) lown[idx] = (csp > 0) ? cown[csp - 1] : 0;
+        } else if (op == 0x36 || op == 0x37 || op == 0x38 || op == 0x39) { /* i/l/f/d store idx: local not a ref */
+            int idx = bc[pc0 + 1]; if (idx < 64) lown[idx] = 0;
+        } else if (op >= 0x3b && op <= 0x4a) {                     /* i/l/f/d store_0..3 */
+            int base = (op <= 0x3e) ? 0x3b : (op <= 0x42) ? 0x3f : (op <= 0x46) ? 0x43 : 0x47;
+            int idx = op - base; if (idx < 64) lown[idx] = 0;
+        }
+        {
+            int pops, pushes, owned;
+            jvm_delta(op, bc, pc0, cp, &pops, &pushes, &owned);
+            for (int k = 0; k < pops && csp > 0; k++) csp--;
+            for (int k = 0; k < pushes; k++) { if (csp < 512) cown[csp] = (owned && k == pushes - 1) ? 1 : 0; csp++; }
         }
         if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
     }

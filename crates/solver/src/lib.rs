@@ -83,14 +83,14 @@ pub fn run(program: &mut Program) -> Stats {
             roots.push(name.clone());
         }
     }
-    // Open-world (--dynamic): a virtual method may be invoked by dynamically loaded /
-    // JIT-defined code that RTA cannot see, so pruning it (leaving a null vtable slot)
-    // would crash a later virtual dispatch. Keep every virtual method with a body as a
-    // root, so vtables stay fully populated for runtime dispatch.
+    // Open-world (--dynamic): dynamically loaded / JIT-defined code (invisible to RTA)
+    // may call ANY method — virtual dispatch, a constructor via `new`, a static — so
+    // pruning any of them would leave a null vtable slot or a null code pointer that a
+    // runtime call jumps through. Keep every method with a body as a root.
     if program.dynamic {
         for c in &program.classes {
             for m in &c.methods {
-                if m.is_virtual() && m.has_body && func_index.contains_key(&m.mangled) {
+                if m.has_body && func_index.contains_key(&m.mangled) {
                     roots.push(m.mangled.clone());
                 }
             }

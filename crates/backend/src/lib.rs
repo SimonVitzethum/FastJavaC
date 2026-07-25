@@ -810,6 +810,16 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     // Strings/wrappers take part in virtual dispatch (equals/hashCode/
     // toString) → their own vtable, even though they are not created via `new`.
     let mut instantiated = instantiated;
+    // Open-world (--dynamic): dynamically loaded / JIT-defined code may `new` or subclass
+    // ANY registered class, so every non-interface class needs a vtable (drop/trace/
+    // dispatch). Emit them all.
+    if program.dynamic {
+        for c in &program.classes {
+            if !c.is_interface {
+                instantiated.insert(c.name.as_str());
+            }
+        }
+    }
     if program.class("java/lang/String").is_some() {
         instantiated.insert("java/lang/String");
     }
