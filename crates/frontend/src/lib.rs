@@ -2796,6 +2796,10 @@ fn lower_block(
                         ("__fjc_call_ref", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;") => ("jrt_call_static_ref", 4),
                         // Double-returning call (result in xmm0):
                         ("__fjc_call_d", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;D)D") => ("jrt_call_double", 4),
+                        // Float-returning call:
+                        ("__fjc_call_f", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;F)F") => ("jrt_call_float", 4),
+                        // Factory call: no-arg method returning a freshly-created object (no extra retain):
+                        ("__fjc_call_new", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;") => ("jrt_call_new", 3),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();

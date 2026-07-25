@@ -2785,6 +2785,18 @@ static int jit_arg_count(const char *desc, int *is_void) {
     return k;
 }
 
+/* Resolve a Class cp index to its registered FjcClass (for `new`). */
+static const FjcClass *jit_resolve_class(const CpInfo *cp, int cref) {
+    if (!cp || cref <= 0 || cref >= cp->cpc) return NULL;
+    int cni = cp->cls_ni[cref];
+    if (cni <= 0 || cni >= cp->cpc) return NULL;
+    char dotted[256];
+    int cl = cp->ul[cni]; if (cl >= 256) return NULL;
+    for (int i = 0; i < cl; i++) { char c = (char)cp->u[cni][i]; dotted[i] = c == '/' ? '.' : c; }
+    dotted[cl] = '\0';
+    return jrt_class_by_name(dotted);
+}
+
 static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc, const CpInfo *cp) {
     if (n <= 0 || n >= (1 << 16)) return NULL;
     JIT_LEN = 0; JIT_NFIX = 0;
@@ -2863,6 +2875,28 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0xaf: jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je1(0xC3); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
             case 0x87: je1(0x58); jeN("\xF2\x0F\x2A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* i2d: cvtsi2sd xmm0,eax; movq rax,xmm0; push */
             case 0x8e: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* d2i: movq xmm0,rax; cvttsd2si eax,xmm0; push */
+            /* --- floats (32-bit; low 32 of a slot holds the bits; arithmetic via xmm ss) --- */
+            case 0x0b: je_push_imm(0); pc++; break;                                  /* fconst_0 */
+            case 0x0c: je_push_imm((int32_t)0x3F800000); pc++; break;                /* fconst_1 (1.0f) */
+            case 0x0d: je_push_imm((int32_t)0x40000000); pc++; break;                /* fconst_2 (2.0f) */
+            case 0x17: je_push_local(bc[pc + 1]); pc += 2; break;                    /* fload */
+            case 0x22: case 0x23: case 0x24: case 0x25: je_push_local(op - 0x22); pc++; break; /* fload_0..3 */
+            case 0x38: je_pop_local(bc[pc + 1]); pc += 2; break;                     /* fstore */
+            case 0x43: case 0x44: case 0x45: case 0x46: je_pop_local(op - 0x43); pc++; break;  /* fstore_0..3 */
+            case 0x62: case 0x66: case 0x6a: case 0x6e: {                            /* fadd/fsub/fmul/fdiv */
+                unsigned char opc = op == 0x62 ? 0x58 : op == 0x66 ? 0x5C : op == 0x6a ? 0x59 : 0x5E; /* ss */
+                je1(0x58);
+                jeN("\x66\x0F\x6E\xC8", 4);     /* movd xmm1, eax  */
+                jeN("\x66\x0F\x6E\x04\x24", 5); /* movd xmm0, [rsp] */
+                je1(0xF3); je1(0x0F); je1(opc); je1(0xC1); /* OPss xmm0, xmm1 */
+                jeN("\x66\x0F\x7E\x04\x24", 5); /* movd [rsp], xmm0 */
+                pc++; break;
+            }
+            case 0xae: jeN("\x66\x0F\x6E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je1(0xC3); pc++; break; /* freturn: movd xmm0,[rsp]; add rsp,8; ret */
+            case 0x86: je1(0x58); jeN("\xF3\x0F\x2A\xC0", 4); jeN("\x66\x0F\x7E\xC0", 4); je1(0x50); pc++; break; /* i2f */
+            case 0x8b: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* f2i */
+            case 0x8d: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x0F\x5A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* f2d */
+            case 0x90: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x0F\x5A\xC0", 4); jeN("\x66\x0F\x7E\xC0", 4); je1(0x50); pc++; break; /* d2f */
             /* --- exceptions --- */
             case 0xbf: { /* athrow: jump to a covering handler (the exception is on the stack) */
                 int handler = -1;
@@ -2892,13 +2926,32 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 else { jeN("\x89\x81", 2); je_i32(off); }         /* mov [rcx+off], eax */
                 pc += 3; break;
             }
-            /* --- invokestatic: call another registered method (JIT-defined or AOT) --- */
-            case 0xb8: {
+            /* --- new: allocate an object of a registered (AOT) class --- */
+            case 0xbb: {
+                const FjcClass *nc = jit_resolve_class(cp, (bc[pc + 1] << 8) | bc[pc + 2]);
+                if (!nc || !nc->vtable || nc->instance_size == 0) return NULL;
+                jeN("\x48\x83\xEC\x10", 4);                     /* sub rsp,16 (save rdi + align) */
+                jeN("\x48\x89\x3C\x24", 4);                     /* mov [rsp], rdi */
+                je1(0xBF); je_i32((int32_t)nc->instance_size);  /* mov edi, size */
+                je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)&jrt_alloc); /* mov rax,&jrt_alloc */
+                jeN("\xFF\xD0", 2);                             /* call rax  (rax=obj, rc=1, zeroed) */
+                jeN("\x48\x8B\x3C\x24", 4);                     /* mov rdi,[rsp] (restore) */
+                je1(0x48); je1(0xB9); je_i64((int64_t)(uintptr_t)nc->vtable); /* mov rcx, vtable */
+                jeN("\x48\x89\x48\x08", 4);                     /* mov [rax+8], rcx (set vtable) */
+                jeN("\x48\x83\xC4\x10", 4);                     /* add rsp,16 */
+                je1(0x50);                                      /* push rax */
+                pc += 3; break;
+            }
+            /* --- invoke: call another registered method (invokestatic / invokespecial;
+             * invokespecial adds the receiver as arg0, e.g. for <init>) --- */
+            case 0xb7: case 0xb8: {
                 char mdesc[256];
                 const FjcMethod *m = jit_resolve_method(cp, (bc[pc + 1] << 8) | bc[pc + 2], mdesc, sizeof mdesc);
                 if (!m) return NULL;
-                int voidret = 0, K = jit_arg_count(mdesc, &voidret);
-                if (K < 0 || K > 60) return NULL;
+                int voidret = 0, kargs = jit_arg_count(mdesc, &voidret);
+                if (kargs < 0) return NULL;
+                int K = kargs + (op == 0xb7 ? 1 : 0); /* invokespecial: + receiver */
+                if (K > 60) return NULL;
                 /* Callee frame (528 B): [rsp]=saved our-RDI, [rsp+8..)=callee locals (64 slots).
                  * Copy the K operand-stack args (arg0 deepest) into locals[0..K-1], set RDI to
                  * the callee locals, indirect-call through &FjcMethod.code (filled at run time,
@@ -3272,6 +3325,32 @@ double jrt_call_double(const void *cls_j, const void *m_j, const void *d_j, doub
     double (*fn)(int64_t *) = (double (*)(int64_t *))mm->code;
     return fn(locals);
 }
+
+/* Float invoker: a (F)F JITted method returns its result in xmm0 (low 32). */
+float jrt_call_float(const void *cls_j, const void *m_j, const void *d_j, float arg) {
+    char cls[256], m[256], d[256];
+    jstr_to_cstr(cls_j, cls, sizeof cls); jstr_to_cstr(m_j, m, sizeof m); jstr_to_cstr(d_j, d, sizeof d);
+    const FjcMethod *mm = jrt_method(jrt_class_by_name(cls), m, d);
+    if (!mm || !mm->code) return 0.0f;
+    int64_t locals[64] = {0};
+    memcpy(&locals[0], &arg, sizeof(float));
+    float (*fn)(int64_t *) = (float (*)(int64_t *))mm->code;
+    return fn(locals);
+}
+
+/* Factory invoker (point: `new`): call a no-arg method that returns a freshly created
+ * object and hand it to the host WITHOUT an extra retain — the method already owns the
+ * +1 from `new`, which transfers to the host (balanced). NOTE: JITted code does no RC
+ * bookkeeping, so objects created and dropped LOCALLY in a JITted method would leak; only
+ * the create-and-return (factory) pattern is RC-correct until JIT-side RC lands. */
+void *jrt_call_new(const void *cls_j, const void *m_j, const void *d_j) {
+    char cls[256], m[256], d[256];
+    jstr_to_cstr(cls_j, cls, sizeof cls); jstr_to_cstr(m_j, m, sizeof m); jstr_to_cstr(d_j, d, sizeof d);
+    const FjcMethod *mm = jrt_method(jrt_class_by_name(cls), m, d);
+    if (!mm || !mm->code) return NULL;
+    int64_t locals[64] = {0};
+    return (void *)(uintptr_t)((jit_fn)mm->code)(locals);
+}
 #else
 int32_t jrt_jit_run(const void *a, const void *b, const void *c, int32_t d) {
     (void)a; (void)b; (void)c; (void)d; return -100; /* needs --dynamic on x86-64 */
@@ -3287,6 +3366,8 @@ int64_t jrt_call_static(const void *a, const void *b, const void *c, int32_t d) 
 int32_t jrt_call_static_obj1(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return -100; }
 void *jrt_call_static_ref(const void *a, const void *b, const void *c, const void *e) { (void)a; (void)b; (void)c; (void)e; return (void *)0; }
 double jrt_call_double(const void *a, const void *b, const void *c, double d) { (void)a; (void)b; (void)c; (void)d; return 0.0; }
+float jrt_call_float(const void *a, const void *b, const void *c, float d) { (void)a; (void)b; (void)c; (void)d; return 0.0f; }
+void *jrt_call_new(const void *a, const void *b, const void *c) { (void)a; (void)b; (void)c; return (void *)0; }
 #endif
 
 /* ---- M1: load a native module (.so) and run its entry point ----------------
