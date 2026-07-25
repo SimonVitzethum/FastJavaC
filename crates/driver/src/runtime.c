@@ -3899,6 +3899,8 @@ void *jrt_call_new(const void *a, const void *b, const void *c) { (void)a; (void
 #include <sys/types.h>
 #include <unistd.h>
 #include <ffi.h>
+#include <stdarg.h>
+static ffi_type *ffi_of(char t);   /* fwd (defined with the general FFI call below) */
 
 /* ---- JNI bridge: call the JDK's own compiled native leaves (NATIVE-STRATEGY.md) ----
  * A socket/file/etc. leaf we hand-write; but the long tail (zip, charsets, crypto) is
@@ -4044,6 +4046,81 @@ static int32_t jni_bridge_pushlocalframe(void *e, int32_t n) { (void)e; (void)n;
 static void *jni_bridge_nullptr(void *e) { (void)e; return NULL; }   /* ExceptionOccurred */
 static int32_t jni_bridge_zero(void *e) { (void)e; return 0; }       /* ExceptionCheck */
 
+/* --- Method callbacks: native code calls back into Java. GetMethodID → &FjcMethod;
+ * Call<T>Method dispatches virtually (obj vtable[vtable_index]) or directly (static/
+ * exact m->code) and libffi-calls the fastjavac native ABI (this in arg0). Varargs
+ * are promoted per JNI (int/double); we narrow F back and pass real types to ffi. */
+static const FjcMethod *jni_find_method(const FjcClass *c, const char *name, const char *sig) {
+    while (c) {
+        for (uint32_t i = 0; i < c->n_methods; i++)
+            if (jrt_cstreq(c->methods[i].name, name) && jrt_cstreq(c->methods[i].desc, sig))
+                return &c->methods[i];
+        c = c->super;
+    }
+    return NULL;
+}
+static void *jni_bridge_getmethodid(void *e, void *cls, const char *name, const char *sig) {
+    (void)e; return (void *)jni_find_method((const FjcClass *)cls, name, sig);
+}
+static int64_t jni_call_va(void *recv, const FjcMethod *m, va_list ap, char ret) {
+    if (!m) return 0;
+    void *fn;
+    if (recv && m->vtable_index >= 0) fn = (*(void ***)((char *)recv + 8))[m->vtable_index];
+    else fn = (void *)m->code;
+    if (!fn) return 0;
+    const char *p = m->desc; if (*p == '(') p++;
+    ffi_type *at[34]; void *av[34];
+    union { int32_t i; int64_t j; float f; double d; void *p; } st[34];
+    int n = 0;
+    if (recv) { at[n] = &ffi_type_pointer; st[n].p = recv; av[n] = &st[n].p; n++; }
+    while (*p && *p != ')' && n < 34) {
+        char kind = *p;
+        if (*p == '[') { while (*p == '[') p++; kind = 'L'; if (*p == 'L') { while (*p && *p != ';') p++; } }
+        else if (*p == 'L') { kind = 'L'; while (*p && *p != ';') p++; }
+        switch (kind) {
+            case 'J': st[n].j = va_arg(ap, int64_t); at[n] = &ffi_type_sint64; av[n] = &st[n].j; break;
+            case 'F': st[n].f = (float)va_arg(ap, double); at[n] = &ffi_type_float; av[n] = &st[n].f; break;
+            case 'D': st[n].d = va_arg(ap, double); at[n] = &ffi_type_double; av[n] = &st[n].d; break;
+            case 'L': st[n].p = va_arg(ap, void *); at[n] = &ffi_type_pointer; av[n] = &st[n].p; break;
+            default:  st[n].i = va_arg(ap, int); at[n] = &ffi_type_sint32; av[n] = &st[n].i; break;
+        }
+        n++; p++;
+    }
+    ffi_cif cif;
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, ffi_of(ret), at) != FFI_OK) return 0;
+    union { ffi_arg a; int64_t j; float f; double d; } r; r.j = 0;
+    ffi_call(&cif, FFI_FN(fn), &r, av);
+    switch (ret) {
+        case 'V': return 0;
+        case 'F': { int32_t b; memcpy(&b, &r.f, 4); return (int64_t)b; }
+        case 'D': { int64_t b; memcpy(&b, &r.d, 8); return b; }
+        default:  return (int64_t)r.a;
+    }
+}
+/* instance Call<T>Method(env, obj, mid, …); static CallStatic<T>Method(env, cls, mid, …). */
+#define CALLI(nm, RT, RC, CH) \
+  RT jni_##nm(void *e, void *o, void *m, ...) { (void)e; va_list ap; va_start(ap, m); \
+    int64_t r = jni_call_va(o, (const FjcMethod *)m, ap, CH); va_end(ap); RC }
+#define CALLS(nm, RT, RC, CH) \
+  RT jni_##nm(void *e, void *c, void *m, ...) { (void)e; (void)c; va_list ap; va_start(ap, m); \
+    int64_t r = jni_call_va(NULL, (const FjcMethod *)m, ap, CH); va_end(ap); RC }
+#define RI  return (int32_t)r;
+#define RJ  return r;
+#define RB  return (int8_t)r;
+#define RP  return (void *)(intptr_t)r;
+#define RV  (void)r; return;
+#define RD  { double d; memcpy(&d, &r, 8); return d; }
+#define RF  { int32_t x = (int32_t)r; float f; memcpy(&f, &x, 4); return f; }
+CALLI(CallVoidMethod, void, RV, 'V')      CALLS(CallStaticVoidMethod, void, RV, 'V')
+CALLI(CallIntMethod, int32_t, RI, 'I')    CALLS(CallStaticIntMethod, int32_t, RI, 'I')
+CALLI(CallLongMethod, int64_t, RJ, 'J')   CALLS(CallStaticLongMethod, int64_t, RJ, 'J')
+CALLI(CallBooleanMethod, int8_t, RB, 'Z') CALLS(CallStaticBooleanMethod, int8_t, RB, 'Z')
+CALLI(CallObjectMethod, void *, RP, 'L')  CALLS(CallStaticObjectMethod, void *, RP, 'L')
+CALLI(CallDoubleMethod, double, RD, 'D')  CALLS(CallStaticDoubleMethod, double, RD, 'D')
+CALLI(CallFloatMethod, float, RF, 'F')    CALLS(CallStaticFloatMethod, float, RF, 'F')
+#undef CALLI
+#undef CALLS
+
 static void *jni_table[236];                 /* JNINativeInterface_ slot count */
 static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
 static int jni_ready;                        /* 0 unknown, 1 ok, -1 unavailable */
@@ -4141,6 +4218,23 @@ static void jni_env_setup(void) {
     jni_table[226] = (void *)jni_bridge_newweakref;
     jni_table[227] = (void *)jni_bridge_noref;           /* DeleteWeakGlobalRef */
     jni_table[228] = (void *)jni_bridge_zero;            /* ExceptionCheck → false */
+    /* method callbacks (native → Java) */
+    jni_table[33]  = (void *)jni_bridge_getmethodid;
+    jni_table[113] = (void *)jni_bridge_getmethodid;     /* GetStaticMethodID */
+    jni_table[34]  = (void *)jni_CallObjectMethod;
+    jni_table[37]  = (void *)jni_CallBooleanMethod;
+    jni_table[49]  = (void *)jni_CallIntMethod;
+    jni_table[52]  = (void *)jni_CallLongMethod;
+    jni_table[55]  = (void *)jni_CallFloatMethod;
+    jni_table[58]  = (void *)jni_CallDoubleMethod;
+    jni_table[61]  = (void *)jni_CallVoidMethod;
+    jni_table[114] = (void *)jni_CallStaticObjectMethod;
+    jni_table[117] = (void *)jni_CallStaticBooleanMethod;
+    jni_table[129] = (void *)jni_CallStaticIntMethod;
+    jni_table[132] = (void *)jni_CallStaticLongMethod;
+    jni_table[135] = (void *)jni_CallStaticFloatMethod;
+    jni_table[138] = (void *)jni_CallStaticDoubleMethod;
+    jni_table[141] = (void *)jni_CallStaticVoidMethod;
     jni_table_ptr = jni_table;
 }
 
