@@ -74,9 +74,66 @@ This exercises only **frontend lowering (bytecode → IR)**. It does not test, a
 So: the *bytecode/JDK-compile* front is much closer than expected; the *runtime engine*
 is where the multi-person-year effort concentrates.
 
-## Immediate next wins (cheap, high-signal)
-1. Implement the 3 opcodes `i2b` / `i2c` / `dup_x1` (each ~an hour) and re-run the census.
-2. Compile a small `java.base` cluster **with** its transitive dependencies (a real
-   closed world) to confirm the 207 dependency errors collapse — the direct test of the
-   whole-JDK thesis.
-3. Start the AOT stencil library for the copy-and-patch JIT (Spike 2 → product).
+## Follow-ups 1–3 (done)
+
+### 1. Implement the missing opcodes ✅ DONE
+Added `i2b`/`i2c`/`i2s` (narrowing conversions) + `dup_x1` (stack shuffle) to the
+decoder and frontend. Re-running the census over the same 600 `java.base` classes:
+**true opcode gaps 26 → 0.** The only remaining errors are missing-dependency. Regression
+test `examples/ConvOps.java` (i2b=44, i2c=4464, i2s=4464, dup_x1 field-assign=9).
+
+### 2. Grow the closed world → dependency errors collapse ✅ DEMONSTRATED
+Compiled progressively larger `java.base` clusters as one closed world and watched the
+first wall move:
+
+| Closed world | First wall | Kind |
+|---|---|---|
+| `HashMap` alone | `class X not in input` | dependency |
+| `java.lang`+`java.util` top-level (793) | `new j.u.c.ConcurrentHashMap not in input` | dependency, moved **outward** |
+| all `java.util`+`java.lang` (2424) | `StringBuilder.append(F)` unsupported | **real feature** (intrinsic incompleteness) |
+| entire `java.base` (7357) | `GB18030: invalid Modified-UTF-8` | **parser edge case** (huge string constant) |
+
+**Conclusion:** within-module "missing class" errors are an *ordering artifact of partial
+input* — they migrate outward and disappear as the closure is supplied. The residual,
+enumerable backlog is: (a) **parser robustness** on pathological constants (charset
+tables), (b) **completing/replacing the hand-modeled `String`/`StringBuilder` intrinsics**
+with the real compiled classes (they currently *shadow* the real ones and are
+incomplete), (c) **reflection/`invokedynamic` generality** (roadmap §3/§4). Not an
+infinite dependency problem — the whole-JDK-closed-world thesis holds.
+
+### 3. Start the copy-and-patch stencil library ✅ STARTED
+See `spikes/stencil_lib.c` and "§ Stencil library" below: composition of multiple AOT
+stencils (not just one hole) into a native method, with the calling convention and
+measurements.
+
+## Stencil library design (copy-and-patch → product)
+
+The single-stencil spike (Spike 2) is extended to **composition**, the key new
+capability. A stencil is a fixed machine-code template with typed **holes** (immediates /
+relocations). A method is JIT-compiled by concatenating one stencil per operation and
+patching each hole — no assembler, no LLVM at runtime.
+
+- **Calling convention (spike):** a uniform *accumulator* model — the working value lives
+  in `eax`; each stencil reads/updates it and falls through to the next; a final `ret`
+  stencil returns it. (Production: a threaded / tail-call convention with a virtual-stack
+  pointer in a fixed register, so arbitrary JVM stack bytecode composes; stencils derived
+  by compiling C snippets with a tail-call CC — Xu & Kjølstad — instead of hand-written
+  bytes.)
+- **Stencil table (spike):** `LOAD_CONST k` (`mov eax,imm`), `ADD_CONST k`
+  (`add eax,imm`), `MUL_CONST k` (`imul eax,eax,imm`), `RET`. Each carries its hole
+  offset. A production JVM set has one stencil per bytecode (loads/stores/arith/branches/
+  calls) with holes for constants, local slots, branch targets, and callee addresses.
+- **JIT step:** for each op, `memcpy` its stencil into the code buffer and patch the hole
+  with this op's operand; end with `RET`. Splice into the running image via the Phase-5
+  patcher.
+
+Measured (`spikes/stencil_lib.c`, composing `(10 + 5) * 3` from 4 stencils):
+```
+composed 4 stencils -> (10+5)*3 = 45  (expected 45)
+method code size:   17 bytes
+per-method JIT cost: 337.1 ns  (4 stencils, incl. flush + call)
+```
+Composition + multi-hole patching works; **17 bytes / ~337 ns** for a 4-op method keeps
+the "little performance, little RAM" budget under composition. Next: derive the full
+per-bytecode stencil set from C snippets (tail-call CC) and wire the virtual-stack
+convention, then integrate as FastJavaC's Tier-1 JIT feeding the Phase-5 splice path.
