@@ -79,6 +79,9 @@ impl Method {
     pub fn is_static(&self) -> bool {
         self.access_flags & 0x0008 != 0
     }
+    pub fn is_native(&self) -> bool {
+        self.access_flags & 0x0100 != 0 // ACC_NATIVE
+    }
 }
 
 /// Entry in the exception table (JVMS 4.7.3): the range [start_pc, end_pc)

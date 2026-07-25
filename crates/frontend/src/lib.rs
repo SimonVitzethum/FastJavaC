@@ -101,6 +101,7 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
             desc: m.descriptor.clone(),
             is_static: m.is_static(),
             has_body: m.code.is_some(),
+            is_native: m.is_native(),
             mangled: mangle(&cf.this_class, &m.name, &m.descriptor),
         })
         .collect();
@@ -131,7 +132,7 @@ pub fn register_builtins(program: &mut Program) {
         name: name.to_string(),
         desc: desc.to_string(),
         is_static: false,
-        has_body: true,
+        has_body: true, is_native: false,
         mangled: mangled.to_string(),
     };
     let builtin = |name: &str, prefix: &str| ClassInfo {
@@ -162,7 +163,7 @@ pub fn register_builtins(program: &mut Program) {
             name: "compareTo".into(),
             desc: "(Ljava/lang/Object;)I".into(),
             is_static: false,
-            has_body: false,
+            has_body: false, is_native: false,
             mangled: mangle("java/lang/Comparable", "compareTo", "(Ljava/lang/Object;)I"),
         }],
         has_clinit: false,
@@ -195,7 +196,7 @@ fn register_concurrency(program: &mut Program) {
             name: "run".into(),
             desc: "()V".into(),
             is_static: false,
-            has_body: false,
+            has_body: false, is_native: false,
             mangled: mangle("java/lang/Runnable", "run", "()V"),
         }],
         has_clinit: false,
@@ -215,7 +216,7 @@ fn register_concurrency(program: &mut Program) {
             name: "<init>".into(),
             desc: "(Ljava/lang/Runnable;)V".into(),
             is_static: false,
-            has_body: true,
+            has_body: true, is_native: false,
             mangled: init.clone(),
         }],
         has_clinit: false,
@@ -269,8 +270,8 @@ fn register_throwables(program: &mut Program) {
             fields,
             static_fields: Vec::new(),
             methods: vec![
-                MethodInfo { name: "<init>".into(), desc: "()V".into(), is_static: false, has_body: true, mangled: init0.clone() },
-                MethodInfo { name: "<init>".into(), desc: "(Ljava/lang/String;)V".into(), is_static: false, has_body: true, mangled: init1.clone() },
+                MethodInfo { name: "<init>".into(), desc: "()V".into(), is_static: false, has_body: true, is_native: false, mangled: init0.clone() },
+                MethodInfo { name: "<init>".into(), desc: "(Ljava/lang/String;)V".into(), is_static: false, has_body: true, is_native: false, mangled: init1.clone() },
             ],
             has_clinit: false,
         });
@@ -325,7 +326,7 @@ fn register_throwables(program: &mut Program) {
             name: "<init>".into(),
             desc: "(Ljava/lang/String;Ljava/lang/Throwable;)V".into(),
             is_static: false,
-            has_body: true,
+            has_body: true, is_native: false,
             mangled: me_init.clone(),
         }],
         has_clinit: false,
@@ -371,10 +372,10 @@ fn register_enum(program: &mut Program) {
         ],
         static_fields: Vec::new(),
         methods: vec![
-            MethodInfo { name: "name".into(), desc: "()Ljava/lang/String;".into(), is_static: false, has_body: true, mangled: name_m.clone() },
-            MethodInfo { name: "ordinal".into(), desc: "()I".into(), is_static: false, has_body: true, mangled: ord_m.clone() },
-            MethodInfo { name: "toString".into(), desc: "()Ljava/lang/String;".into(), is_static: false, has_body: true, mangled: tostr_m.clone() },
-            MethodInfo { name: "<init>".into(), desc: "(Ljava/lang/String;I)V".into(), is_static: false, has_body: true, mangled: init_m.clone() },
+            MethodInfo { name: "name".into(), desc: "()Ljava/lang/String;".into(), is_static: false, has_body: true, is_native: false, mangled: name_m.clone() },
+            MethodInfo { name: "ordinal".into(), desc: "()I".into(), is_static: false, has_body: true, is_native: false, mangled: ord_m.clone() },
+            MethodInfo { name: "toString".into(), desc: "()Ljava/lang/String;".into(), is_static: false, has_body: true, is_native: false, mangled: tostr_m.clone() },
+            MethodInfo { name: "<init>".into(), desc: "(Ljava/lang/String;I)V".into(), is_static: false, has_body: true, is_native: false, mangled: init_m.clone() },
         ],
         has_clinit: false,
     });
@@ -522,7 +523,7 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
             name: info.sam_method.clone(),
             desc: info.sam_desc.clone(),
             is_static: false,
-            has_body: true,
+            has_body: true, is_native: false,
             mangled: sam_mangled.clone(),
         }],
         has_clinit: false,
@@ -896,6 +897,43 @@ fn is_subtype(program: &Program, sub: &str, sup: &str) -> bool {
     match ci.super_name.as_deref() {
         Some(s) => is_subtype(program, s, sup),
         None => false,
+    }
+}
+
+/// JNI name mangling (JNI spec 8): package `/`/`.` → `_`, `_` → `_1`, `;` → `_2`,
+/// `[` → `_3`, other non-alphanumerics → `_0xxxx`. Used to form the exported native
+/// symbol `Java_<class>_<method>` a System.load-ed lib provides.
+fn jni_mangle(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '/' | '.' => o.push('_'),
+            '_' => o.push_str("_1"),
+            ';' => o.push_str("_2"),
+            '[' => o.push_str("_3"),
+            c if c.is_ascii_alphanumeric() => o.push(c),
+            c => o.push_str(&format!("_0{:04x}", c as u32)),
+        }
+    }
+    o
+}
+fn jni_symbol(class: &str, name: &str) -> String {
+    format!("Java_{}_{}", jni_mangle(class), jni_mangle(name))
+}
+
+/// Is `class.name desc` a `native` method (walking the superclass chain)? Such a
+/// call is auto-bound to its `Java_*` symbol via the libffi JNI bridge.
+fn is_native_method(program: &Program, class: &str, name: &str, desc: &str) -> bool {
+    let mut cur = class;
+    loop {
+        let Some(ci) = program.class(cur) else { return false };
+        if let Some(m) = ci.methods.iter().find(|m| m.name == name && m.desc == desc) {
+            return m.is_native;
+        }
+        match ci.super_name.as_deref() {
+            Some(s) => cur = s,
+            None => return false,
+        }
     }
 }
 
@@ -3047,6 +3085,21 @@ fn lower_block(
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                     continue;
                 }
+                // System.load / loadLibrary → dlopen the native lib into the JNI
+                // bridge's resolver, so a native method call auto-binds to its Java_*.
+                if class == "java/lang/System"
+                    && (name == "load" || name == "loadLibrary")
+                    && desc == "(Ljava/lang/String;)V"
+                {
+                    let path = pop!();
+                    let d = ml.fresh(Ty::I32); // discard the status
+                    stmts.push(Statement::Call {
+                        dest: Some(d),
+                        func: "jrt_native_load".to_string(),
+                        args: vec![Operand::Copy(path)],
+                    });
+                    continue;
+                }
                 if name == "findVarHandle"
                     && desc.ends_with(")Ljava/lang/invoke/VarHandle;")
                 {
@@ -3345,6 +3398,56 @@ fn lower_block(
                     let dest = push!(rty, Rvalue::Use(Operand::ConstI32(0)));
                     stmts.pop(); // placeholder
                     stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args });
+                    continue;
+                }
+                // Auto-bind a static `native` method (no intrinsic) to its Java_*
+                // symbol via the libffi JNI bridge: push args in order, then invoke.
+                if is_native_method(program, class, name, desc) {
+                    let sym = jni_symbol(class, name);
+                    let argdesc = desc
+                        .rsplit_once(')')
+                        .map(|(a, _)| a.trim_start_matches('(').to_string())
+                        .unwrap_or_default();
+                    let (ptys, rty) = parse_descriptor(desc)?;
+                    let mut argslots: Vec<(Local, Ty)> = Vec::new();
+                    for pty in ptys.iter().rev() {
+                        argslots.push((pop!(), *pty));
+                    }
+                    argslots.reverse();
+                    for (l, ty) in &argslots {
+                        let f = match ty {
+                            Ty::I32 => "jrt_jni_arg_i",
+                            Ty::I64 => "jrt_jni_arg_j",
+                            Ty::F32 => "jrt_jni_arg_f",
+                            Ty::F64 => "jrt_jni_arg_d",
+                            Ty::Ref => "jrt_jni_arg_p",
+                            Ty::Void => continue,
+                        };
+                        stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(*l)] });
+                    }
+                    let sid = program.intern_string(&sym);
+                    let aid = program.intern_string(&argdesc);
+                    let invfn = match rty {
+                        Ty::I32 => "jrt_jni_invoke_i",
+                        Ty::I64 => "jrt_jni_invoke_j",
+                        Ty::F32 => "jrt_jni_invoke_f",
+                        Ty::F64 => "jrt_jni_invoke_d",
+                        Ty::Ref => "jrt_jni_invoke_p",
+                        Ty::Void => "jrt_jni_invoke_v",
+                    };
+                    let iargs = vec![
+                        Operand::ConstStr(sid),
+                        Operand::ConstStr(aid),
+                        Operand::ConstI32(1), // static → jclass(NULL)
+                        Operand::ConstNull,
+                    ];
+                    if rty == Ty::Void {
+                        stmts.push(Statement::Call { dest: None, func: invfn.to_string(), args: iargs });
+                    } else {
+                        let dest = ml.stack_slot(stack.len(), rty);
+                        stack.push(rty);
+                        stmts.push(Statement::Call { dest: Some(dest), func: invfn.to_string(), args: iargs });
+                    }
                     continue;
                 }
                 let (ptys, rty) = parse_descriptor(desc)?;

@@ -289,6 +289,9 @@ pub struct MethodInfo {
     pub is_static: bool,
     /// false for abstract (no Code attribute).
     pub has_body: bool,
+    /// ACC_NATIVE: no bytecode; bound at runtime to a `Java_<class>_<method>`
+    /// symbol in a System.load-ed lib and called via the libffi JNI bridge.
+    pub is_native: bool,
     /// Mangled function name of the definition in this class.
     pub mangled: String,
 }

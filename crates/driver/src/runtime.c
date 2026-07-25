@@ -3965,6 +3965,14 @@ static int jrt_jni_ensure(void) {
     jni_load(libdir, "libzip.so");
     jni_load(libdir, "libnet.so");    /* best-effort; absent/failed loads are fine */
     jni_load(libdir, "libnio.so");
+    jni_ready = jni_nlibs > 0 ? 1 : 0;
+    return jni_ready > 0;
+}
+
+/* Fill the JNIEnv function table (idempotent). Independent of the JDK — usable for
+ * any native lib loaded via System.load (jrt_native_load). */
+static void jni_env_setup(void) {
+    if (jni_table_ptr) return;
     jni_table[171] = (void *)jni_bridge_arraylen;
     jni_table[184] = (void *)jni_bridge_get_critical;    /* GetByteArrayElements (no copy) */
     jni_table[192] = (void *)jni_bridge_noop;            /* ReleaseByteArrayElements */
@@ -3974,8 +3982,6 @@ static int jrt_jni_ensure(void) {
     jni_table[222] = (void *)jni_bridge_get_critical;
     jni_table[223] = (void *)jni_bridge_release_critical;
     jni_table_ptr = jni_table;
-    jni_ready = jni_nlibs > 0 ? 1 : 0;
-    return jni_ready > 0;
 }
 
 /* Resolve a JNI leaf symbol by name across the loaded JDK libs (+ the global scope),
@@ -3997,6 +4003,7 @@ static void *jni_resolve(const char *sym) {
  * stub, so adding such a bridged native needs NO new C, only a stub. */
 int32_t jrt_jni_ii_aii(const void *sym_jstr, int32_t a, void *arr, int32_t off, int32_t len) {
     if (!arr || !jrt_jni_ensure()) return -1;
+    jni_env_setup();
     char sym[256]; jstr_to_cstr(sym_jstr, sym, sizeof sym);
     int32_t (*fn)(void *, void *, int32_t, void *, int32_t, int32_t) =
         (int32_t (*)(void *, void *, int32_t, void *, int32_t, int32_t))jni_resolve(sym);
@@ -4075,6 +4082,76 @@ int64_t jrt_ffi_call(int64_t addr, const void *argsig_j, int32_t ret, void *args
         default:  return (int64_t)r.a;   /* J / P / L */
     }
 }
+
+/* ---- Automatic JNI native-method binding ----
+ * The frontend, on a call to a `native` method with no intrinsic, pushes the args
+ * in order then invokes: the runtime resolves the standard JNI symbol
+ * Java_<class>_<method>[__<sig>] across the loaded libs and calls it via libffi
+ * with a (JNIEnv*, jclass|jobject, args…) prologue. So unmodified JNI/LWJGL Java
+ * runs once its native lib is System.load-ed. Per-thread arg buffer. */
+static _Thread_local int64_t jni_argbuf[64];
+static _Thread_local char jni_argsig[64];
+static _Thread_local int jni_argn;
+void jrt_jni_arg_i(int32_t v) { if (jni_argn < 64) { jni_argbuf[jni_argn] = (int64_t)v; jni_argsig[jni_argn++] = 'I'; } }
+void jrt_jni_arg_j(int64_t v) { if (jni_argn < 64) { jni_argbuf[jni_argn] = v; jni_argsig[jni_argn++] = 'J'; } }
+void jrt_jni_arg_f(float v)   { if (jni_argn < 64) { int32_t b; memcpy(&b, &v, 4); jni_argbuf[jni_argn] = (int64_t)b; jni_argsig[jni_argn++] = 'F'; } }
+void jrt_jni_arg_d(double v)  { if (jni_argn < 64) { int64_t b; memcpy(&b, &v, 8); jni_argbuf[jni_argn] = b; jni_argsig[jni_argn++] = 'D'; } }
+void jrt_jni_arg_p(void *v)   { if (jni_argn < 64) { jni_argbuf[jni_argn] = (int64_t)(intptr_t)v; jni_argsig[jni_argn++] = 'P'; } }
+
+/* Resolve the JNI symbol (short, then overloaded __<sig>) and libffi-call it with a
+ * (JNIEnv*, jclass|jobject, args…) prologue. Returns the result as int64 bits; the
+ * typed wrappers below reinterpret. Clears the arg buffer. */
+static int64_t jni_invoke_core(const void *sym_j, const void *argdesc_j, int32_t ret, int32_t is_static, void *recv) {
+    int n = jni_argn; jni_argn = 0;
+    jni_env_setup();
+    char sym[512], argd[256];
+    jstr_to_cstr(sym_j, sym, sizeof sym);
+    jstr_to_cstr(argdesc_j, argd, sizeof argd);
+    void *fn = jni_resolve(sym);
+    if (!fn) {   /* overloaded: try Java_…_<name>__<mangled arg descriptor> */
+        char over[768]; size_t k = strlen(sym);
+        if (k + 2 < sizeof over) {
+            memcpy(over, sym, k); over[k++] = '_'; over[k++] = '_';
+            for (const char *p = argd; *p && k < sizeof over - 6; p++) {
+                if (*p == '/') over[k++] = '_';
+                else if (*p == '_') { over[k++] = '_'; over[k++] = '1'; }
+                else if (*p == ';') { over[k++] = '_'; over[k++] = '2'; }
+                else if (*p == '[') { over[k++] = '_'; over[k++] = '3'; }
+                else over[k++] = *p;
+            }
+            over[k] = '\0';
+            fn = jni_resolve(over);
+        }
+    }
+    if (!fn) return 0;
+    (void)is_static;
+    ffi_type *atypes[66]; void *avals[66];
+    void *envp = &jni_table_ptr;
+    atypes[0] = &ffi_type_pointer; avals[0] = &envp;      /* JNIEnv* */
+    atypes[1] = &ffi_type_pointer; avals[1] = &recv;      /* jclass (NULL) | jobject */
+    for (int i = 0; i < n; i++) { atypes[2 + i] = ffi_of(jni_argsig[i]); avals[2 + i] = &jni_argbuf[i]; }
+    ffi_cif cif;
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)(2 + n), ffi_of((char)ret), atypes) != FFI_OK) return 0;
+    union { ffi_arg a; int64_t i64; float f; double d; } r; r.i64 = 0;
+    ffi_call(&cif, FFI_FN(fn), &r, avals);
+    switch ((char)ret) {
+        case 'V': return 0;
+        case 'F': { int32_t b; memcpy(&b, &r.f, 4); return (int64_t)b; }
+        case 'D': { int64_t b; memcpy(&b, &r.d, 8); return b; }
+        case 'Z': case 'B': return (int8_t)(int64_t)r.a;
+        case 'C': case 'S': return (int16_t)(int64_t)r.a;
+        case 'I': return (int32_t)(int64_t)r.a;
+        default:  return (int64_t)r.a;
+    }
+}
+/* Typed entry points — the frontend picks one by the native method's return type,
+ * so the Call's result type matches the C signature exactly. */
+int32_t jrt_jni_invoke_i(const void *s, const void *a, int32_t st, void *r) { return (int32_t)jni_invoke_core(s, a, 'I', st, r); }
+int64_t jrt_jni_invoke_j(const void *s, const void *a, int32_t st, void *r) { return jni_invoke_core(s, a, 'J', st, r); }
+float   jrt_jni_invoke_f(const void *s, const void *a, int32_t st, void *r) { int32_t b = (int32_t)jni_invoke_core(s, a, 'F', st, r); float f; memcpy(&f, &b, 4); return f; }
+double  jrt_jni_invoke_d(const void *s, const void *a, int32_t st, void *r) { int64_t b = jni_invoke_core(s, a, 'D', st, r); double d; memcpy(&d, &b, 8); return d; }
+void   *jrt_jni_invoke_p(const void *s, const void *a, int32_t st, void *r) { return (void *)(intptr_t)jni_invoke_core(s, a, 'L', st, r); }
+void    jrt_jni_invoke_v(const void *s, const void *a, int32_t st, void *r) { jni_invoke_core(s, a, 'V', st, r); }
 
 /* Load an already-built native module (.so) by path, verify its ABI, register its
  * classes, and run fjc_module_main. Shared by the M1 and M2 entry points. */
@@ -4173,6 +4250,17 @@ int32_t jrt_jni_ii_aii(const void *s, int32_t a, void *b, int32_t c, int32_t d) 
 int32_t jrt_native_load(const void *a) { (void)a; return -1; }
 int64_t jrt_native_sym(const void *a) { (void)a; return 0; }
 int64_t jrt_ffi_call(int64_t a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0; }
+void jrt_jni_arg_i(int32_t v) { (void)v; }
+void jrt_jni_arg_j(int64_t v) { (void)v; }
+void jrt_jni_arg_f(float v) { (void)v; }
+void jrt_jni_arg_d(double v) { (void)v; }
+void jrt_jni_arg_p(void *v) { (void)v; }
+int32_t jrt_jni_invoke_i(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0; }
+int64_t jrt_jni_invoke_j(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0; }
+float jrt_jni_invoke_f(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0.0f; }
+double jrt_jni_invoke_d(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0.0; }
+void *jrt_jni_invoke_p(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return (void *)0; }
+void jrt_jni_invoke_v(const void *a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; }
 int32_t jrt_load_jar_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 #endif
 
