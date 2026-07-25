@@ -1,7 +1,8 @@
 package java.util.zip;
-// Native leaf: CRC32 over a byte[] region, computed by the JDK's OWN libzip.so
-// reached through the runtime JNI bridge (jrt_jni_crc32). The __fjc_ name binds
-// to jrt_jni_crc32; the bridge dlopens libjvm+libzip (paths from $JAVA_HOME).
+// General JNI-bridge leaf: any (int, byte[], int, int) -> int JDK native named by
+// its JNI symbol. __fjc_jni_ii_aii binds to jrt_jni_ii_aii, which resolves the
+// symbol across the loaded JDK libs and calls it with a minimal JNIEnv over the
+// fastjavac byte[]. A new bridged checksum needs only a stub naming its symbol.
 final class FjcZip {
-    static native int __fjc_jni_crc32(int crc, byte[] b, int off, int len);
+    static native int __fjc_jni_ii_aii(String jniSymbol, int seed, byte[] b, int off, int len);
 }

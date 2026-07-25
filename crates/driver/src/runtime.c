@@ -3917,42 +3917,90 @@ static void jni_bridge_release_critical(void *env, void *arr, void *carr, int32_
 static int32_t jni_bridge_arraylen(void *env, void *arr) {
     (void)env; return (int32_t)(*(int64_t *)((char *)arr + 16));   /* length @ +16 */
 }
+/* non-critical array access (some leaves use these instead of *Critical) */
+static void jni_bridge_get_region(void *env, void *arr, int32_t start, int32_t len, void *buf) {
+    (void)env; if (arr && buf && len > 0) memcpy(buf, (char *)arr + 32 + start, (size_t)len);
+}
+static void jni_bridge_set_region(void *env, void *arr, int32_t start, int32_t len, const void *buf) {
+    (void)env; if (arr && buf && len > 0) memcpy((char *)arr + 32 + start, buf, (size_t)len);
+}
+static void jni_bridge_noop(void) {}         /* ExceptionClear/ReleaseByteArrayElements */
+
 static void *jni_table[236];                 /* JNINativeInterface_ slot count */
 static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
 static int jni_ready;                        /* 0 unknown, 1 ok, -1 unavailable */
-static int32_t (*crc32_updatebytes)(void *, void *, int32_t, void *, int32_t, int32_t);
+static void *jni_libs[8]; static int jni_nlibs;   /* loaded JDK leaf libs (searched for Java_*) */
+/* tiny resolved-symbol cache so a hot leaf doesn't dlsym per call */
+static struct { char name[128]; void *fn; } jni_cache[64];
+static int jni_ncache;
 
+static void jni_load(const char *dir, const char *name) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL so cross-lib deps resolve */
+    if (h && jni_nlibs < 8) jni_libs[jni_nlibs++] = h;
+}
+
+/* Lazily bring up the bridge: dlopen the real libjvm.so (RTLD_GLOBAL, no VM started —
+ * just its JVM_* symbols) so the JDK leaf libs' NEEDED chain resolves, then dlopen the
+ * common leaf libs. Fill the JNIEnv slots. Idempotent. */
 static int jrt_jni_ensure(void) {
     if (jni_ready) return jni_ready > 0;
     jni_ready = -1;
-    char jvmbuf[4096], zipbuf[4096];
-    const char *libjvm = getenv("FJC_LIBJVM");
-    const char *libzip = getenv("FJC_LIBZIP");
     const char *jh = getenv("JAVA_HOME");
-    if ((!libjvm || !libzip) && jh) {         /* derive from $JAVA_HOME if not given */
-        if (!libjvm) { snprintf(jvmbuf, sizeof jvmbuf, "%s/lib/server/libjvm.so", jh); libjvm = jvmbuf; }
-        if (!libzip) { snprintf(zipbuf, sizeof zipbuf, "%s/lib/libzip.so", jh); libzip = zipbuf; }
+    const char *libjvm = getenv("FJC_LIBJVM");
+    char buf[4096], libdir[4096];
+    if (!libjvm && jh) { snprintf(buf, sizeof buf, "%s/lib/server/libjvm.so", jh); libjvm = buf; }
+    if (!libjvm || !dlopen(libjvm, RTLD_NOW | RTLD_GLOBAL)) return 0;
+    /* leaf-lib directory: $JAVA_HOME/lib, else the dir of FJC_LIBZIP. */
+    if (jh) snprintf(libdir, sizeof libdir, "%s/lib", jh);
+    else {
+        const char *lz = getenv("FJC_LIBZIP");
+        if (!lz) return 0;
+        size_t n = strlen(lz); while (n && lz[n - 1] != '/') n--;
+        if (n >= sizeof libdir) return 0;
+        memcpy(libdir, lz, n ? n - 1 : 0); libdir[n ? n - 1 : 0] = '\0';
     }
-    if (!libjvm || !libzip) return 0;
-    if (!dlopen(libjvm, RTLD_NOW | RTLD_GLOBAL)) return 0;   /* provide JVM_* globally */
-    void *z = dlopen(libzip, RTLD_NOW | RTLD_LOCAL);
-    if (!z) return 0;
-    crc32_updatebytes = (int32_t (*)(void *, void *, int32_t, void *, int32_t, int32_t))
-                        dlsym(z, "Java_java_util_zip_CRC32_updateBytes0");
-    if (!crc32_updatebytes) return 0;
+    jni_load(libdir, "libzip.so");
+    jni_load(libdir, "libnet.so");    /* best-effort; absent/failed loads are fine */
+    jni_load(libdir, "libnio.so");
     jni_table[171] = (void *)jni_bridge_arraylen;
+    jni_table[184] = (void *)jni_bridge_get_critical;    /* GetByteArrayElements (no copy) */
+    jni_table[192] = (void *)jni_bridge_noop;            /* ReleaseByteArrayElements */
+    jni_table[200] = (void *)jni_bridge_get_region;
+    jni_table[208] = (void *)jni_bridge_set_region;
+    jni_table[17]  = (void *)jni_bridge_noop;            /* ExceptionClear */
     jni_table[222] = (void *)jni_bridge_get_critical;
     jni_table[223] = (void *)jni_bridge_release_critical;
     jni_table_ptr = jni_table;
-    jni_ready = 1;
-    return 1;
+    jni_ready = jni_nlibs > 0 ? 1 : 0;
+    return jni_ready > 0;
 }
 
-/* CRC32.updateBytes0(crc, byte[], off, len) via the JDK's real libzip leaf. Returns
- * the updated running crc; -1 if the bridge is unavailable (no JDK libs found). */
-int32_t jrt_jni_crc32(int32_t crc, void *arr, int32_t off, int32_t len) {
+/* Resolve a JNI leaf symbol by name across the loaded JDK libs (+ the global scope),
+ * with a small cache. */
+static void *jni_resolve(const char *sym) {
+    for (int i = 0; i < jni_ncache; i++)
+        if (!strcmp(jni_cache[i].name, sym)) return jni_cache[i].fn;
+    void *f = NULL;
+    for (int i = 0; i < jni_nlibs && !f; i++) f = dlsym(jni_libs[i], sym);
+    if (!f) f = dlsym(RTLD_DEFAULT, sym);
+    if (f && jni_ncache < 64 && strlen(sym) < 128) {
+        strcpy(jni_cache[jni_ncache].name, sym); jni_cache[jni_ncache].fn = f; jni_ncache++;
+    }
+    return f;
+}
+
+/* GENERAL dispatcher for the (JNIEnv, jclass, jint, jbyteArray, jint, jint) -> jint leaf
+ * shape — CRC32.updateBytes0, Adler32.updateBytes, … The symbol is named by the Java
+ * stub, so adding such a bridged native needs NO new C, only a stub. */
+int32_t jrt_jni_ii_aii(const void *sym_jstr, int32_t a, void *arr, int32_t off, int32_t len) {
     if (!arr || !jrt_jni_ensure()) return -1;
-    return crc32_updatebytes(&jni_table_ptr, NULL, crc, arr, off, len);
+    char sym[256]; jstr_to_cstr(sym_jstr, sym, sizeof sym);
+    int32_t (*fn)(void *, void *, int32_t, void *, int32_t, int32_t) =
+        (int32_t (*)(void *, void *, int32_t, void *, int32_t, int32_t))jni_resolve(sym);
+    if (!fn) return -1;
+    return fn(&jni_table_ptr, NULL, a, arr, off, len);
 }
 
 /* Load an already-built native module (.so) by path, verify its ABI, register its
@@ -4048,7 +4096,7 @@ int32_t jrt_load_jar_and_run(const void *jstr) {
 }
 #else
 int32_t jrt_load_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
-int32_t jrt_jni_crc32(int32_t a, void *b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; return -1; }
+int32_t jrt_jni_ii_aii(const void *s, int32_t a, void *b, int32_t c, int32_t d) { (void)s; (void)a; (void)b; (void)c; (void)d; return -1; }
 int32_t jrt_load_jar_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 #endif
 

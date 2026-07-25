@@ -20,5 +20,6 @@ if ! "$fastjavac" --dynamic -o "$work/zc" "$work"/ZipCrc*.class "$zip"/*.class 2
     echo "FAIL zipcrc (build): $(cat "$work/h")"; exit 1; fi
 out="$(JAVA_HOME="$JH" "$work/zc" 2>&1)"; code=$?
 [ "$code" = 0 ] || { echo "FAIL zipcrc (exit $code): $out"; exit 1; }
-[ "$(echo "$out" | tr -d '[:space:]')" = "907060870" ] || { echo "FAIL zipcrc (got '$out', want 907060870)"; exit 1; }
-echo "ok   zipcrc (real JDK libzip CRC32 via runtime JNI bridge)"
+got="$(echo "$out" | tr '\n' ' ')"
+[ "$got" = "907060870 103547413 " ] || { echo "FAIL zipcrc (got '$got', want 907060870 103547413)"; exit 1; }
+echo "ok   zipcrc (real JDK libzip CRC32+Adler32 via general JNI bridge)"
