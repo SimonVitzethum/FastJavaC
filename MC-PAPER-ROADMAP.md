@@ -96,15 +96,18 @@ parallel execution model — it only edits native code that the CPU runs directl
 
 ## 3. The JDK: compile OpenJDK + build the native layer
 
-> **Status (2026-07-25): native layer STARTED.** The `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe`
-> **int/long CAS + memory family** is implemented against fastjavac's object model
-> (`Program::field_byte_offset` gives `objectFieldOffset` a layout-exact byte offset; the
-> get/put/compareAndSet/exchange/getAndAdd/getAndSet ops lower to `jrt_unsafe_*` `__atomic_*`
-> accesses). Real OpenJDK `java.util.concurrent.atomic.AtomicInteger`/`AtomicLong` now
-> compile+run+heap-balance through fastjavac — the first real JDK classes with native methods
-> running end-to-end. Remaining native backlog below; nearest next items: ref-typed Unsafe
-> accessors (need an RC store barrier, for `AtomicReference`), `arrayBaseOffset`/`arrayIndexScale`,
-> then `Object`/`System`/`Class` core natives.
+> **Status (2026-07-25): native layer STARTED — the atomics are DONE.** The
+> `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe` **int/long/reference CAS + memory family** is
+> implemented against fastjavac's object model (`Program::field_byte_offset` gives
+> `objectFieldOffset` a layout-exact byte offset; ops lower to `jrt_unsafe_*` `__atomic_*`
+> accesses; the reference ops carry the RC store barrier). The signature-polymorphic
+> **`java.lang.invoke.VarHandle`** atomics lower to the same layer (findVarHandle bound in
+> `<clinit>` → folded offset → shared helpers), closing the "VarHandle pervasively" item.
+> Real OpenJDK `AtomicInteger`/`AtomicLong` (Unsafe) compile+run+heap-balance, and
+> `AtomicReference`'s VarHandle mechanism runs heap-balanced — the first real JDK classes with
+> native methods running end-to-end. Remaining native backlog below; nearest next items:
+> `Object`/`System`/`Class` core natives (`arraycopy`, `hashCode`, `getClass`, `clone`),
+> `arrayBaseOffset`/`arrayIndexScale`, `Integer.TYPE` (`int.class`), then `java.io`/`nio`.
 
 - **Compile the pure-Java OpenJDK classes** (from `jmods`/`src`) with fastjavac. Most of
   `java.util`, `java.io`, `java.nio`, `java.util.stream`, `java.util.concurrent` is pure
