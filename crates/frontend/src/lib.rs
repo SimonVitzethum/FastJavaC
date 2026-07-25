@@ -248,11 +248,24 @@ fn register_concurrency(program: &mut Program) {
 /// user-defined exceptions with a message work; for the *catch*, these
 /// three base types remain catch-all (sentinels carry no type descriptor).
 fn register_throwables(program: &mut Program) {
-    // (class, superclass)
+    // (class, superclass). Common JDK throwables so `new <X>(…)` / `throw` /
+    // `catch (X)` compile without providing the real classes.
+    // NOTE: exception types thrown by RUNTIME SENTINELS (NullPointerException,
+    // ArithmeticException, ArrayIndex/StringIndexOutOfBoundsException) are
+    // deliberately NOT modelled — the sentinels carry no type descriptor and must
+    // stay catch-all (a modelled class would make `catch (NPE)` do a real
+    // instanceof that misses the sentinel). Only exceptions raised by `new`/`throw`
+    // in user/JDK code are listed.
     let chain = [
         ("java/lang/Throwable", None),
         ("java/lang/Exception", Some("java/lang/Throwable")),
+        ("java/lang/Error", Some("java/lang/Throwable")),
+        ("java/lang/AssertionError", Some("java/lang/Error")),
         ("java/lang/RuntimeException", Some("java/lang/Exception")),
+        ("java/lang/IllegalArgumentException", Some("java/lang/RuntimeException")),
+        ("java/lang/IllegalStateException", Some("java/lang/RuntimeException")),
+        ("java/lang/UnsupportedOperationException", Some("java/lang/RuntimeException")),
+        ("java/lang/NumberFormatException", Some("java/lang/IllegalArgumentException")),
     ];
     for (cls, sup) in chain {
         let init0 = mangle(cls, "<init>", "()V");
