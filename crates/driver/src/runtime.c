@@ -3898,6 +3898,7 @@ void *jrt_call_new(const void *a, const void *b, const void *c) { (void)a; (void
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <ffi.h>
 
 /* ---- JNI bridge: call the JDK's own compiled native leaves (NATIVE-STRATEGY.md) ----
  * A socket/file/etc. leaf we hand-write; but the long tail (zip, charsets, crypto) is
@@ -4003,6 +4004,78 @@ int32_t jrt_jni_ii_aii(const void *sym_jstr, int32_t a, void *arr, int32_t off, 
     return fn(&jni_table_ptr, NULL, a, arr, off, len);
 }
 
+/* ---- General native-call bridge (libffi) — the FFI a JNI/LWJGL-style layer needs ----
+ * System.load a native lib, resolve a symbol to an address, and call ANY C signature
+ * by descriptor. This lets fastjavac Java call GL/GLFW/… function pointers directly
+ * (LWJGL is itself an FFI; ours removes the need for its per-shape dispatchers). */
+int32_t jrt_native_load(const void *path_j) {
+    char path[4096]; jstr_to_cstr(path_j, path, sizeof path);
+    if (!path[0]) return -1;
+    void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) return -2;
+    if (jni_nlibs < 8) jni_libs[jni_nlibs++] = h;
+    return 0;
+}
+int64_t jrt_native_sym(const void *name_j) {
+    char name[256]; jstr_to_cstr(name_j, name, sizeof name);
+    if (!name[0]) return 0;
+    void *f = NULL;
+    for (int i = 0; i < jni_nlibs && !f; i++) f = dlsym(jni_libs[i], name);
+    if (!f) f = dlsym(RTLD_DEFAULT, name);
+    return (int64_t)(intptr_t)f;
+}
+static ffi_type *ffi_of(char t) {
+    switch (t) {
+        case 'V': return &ffi_type_void;
+        case 'Z': case 'B': return &ffi_type_sint8;
+        case 'C': case 'S': return &ffi_type_sint16;
+        case 'I': return &ffi_type_sint32;
+        case 'J': return &ffi_type_sint64;
+        case 'F': return &ffi_type_float;
+        case 'D': return &ffi_type_double;
+        default:  return &ffi_type_pointer;   /* P / L / anything else = pointer-width */
+    }
+}
+/* Call function at `addr` with arg types `argsig` (e.g. "IIJ"), return type `ret`
+ * (a type char). Each arg is one int64 slot in the long[] `args` (int in low bits,
+ * float/double as bit patterns, pointer as value); the result comes back as int64
+ * the same way. FFI_DEFAULT_ABI, so it matches the platform C ABI. */
+int64_t jrt_ffi_call(int64_t addr, const void *argsig_j, int32_t ret, void *args_arr) {
+    if (!addr) return 0;
+    char sig[64]; jstr_to_cstr(argsig_j, sig, sizeof sig);
+    int n = (int)strlen(sig);
+    if (n > 32) return 0;
+    const int64_t *slots = args_arr ? (const int64_t *)((char *)args_arr + 32) : NULL;
+    ffi_type *atypes[32];
+    void *avals[32];
+    union { int8_t i8; int16_t i16; int32_t i32; int64_t i64; float f; double d; } store[32];
+    for (int i = 0; i < n; i++) {
+        atypes[i] = ffi_of(sig[i]);
+        int64_t v = slots ? slots[i] : 0;
+        switch (sig[i]) {
+            case 'Z': case 'B': store[i].i8 = (int8_t)v; avals[i] = &store[i].i8; break;
+            case 'C': case 'S': store[i].i16 = (int16_t)v; avals[i] = &store[i].i16; break;
+            case 'I': store[i].i32 = (int32_t)v; avals[i] = &store[i].i32; break;
+            case 'F': { int32_t b = (int32_t)v; memcpy(&store[i].f, &b, 4); avals[i] = &store[i].f; break; }
+            case 'D': memcpy(&store[i].d, &v, 8); avals[i] = &store[i].d; break;
+            default:  store[i].i64 = v; avals[i] = &store[i].i64; break;   /* J / P / L */
+        }
+    }
+    ffi_cif cif;
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, ffi_of((char)ret), atypes) != FFI_OK) return 0;
+    union { ffi_arg a; int64_t i64; float f; double d; } r; r.i64 = 0;
+    ffi_call(&cif, FFI_FN((void *)(intptr_t)addr), &r, avals);
+    switch ((char)ret) {
+        case 'V': return 0;
+        case 'F': { int32_t b; memcpy(&b, &r.f, 4); return (int64_t)b; }
+        case 'D': { int64_t b; memcpy(&b, &r.d, 8); return b; }
+        case 'Z': case 'B': return (int8_t)(int64_t)r.a;
+        case 'C': case 'S': return (int16_t)(int64_t)r.a;
+        case 'I': return (int32_t)(int64_t)r.a;
+        default:  return (int64_t)r.a;   /* J / P / L */
+    }
+}
+
 /* Load an already-built native module (.so) by path, verify its ABI, register its
  * classes, and run fjc_module_main. Shared by the M1 and M2 entry points. */
 static int32_t load_so_and_run(const char *path) {
@@ -4097,6 +4170,9 @@ int32_t jrt_load_jar_and_run(const void *jstr) {
 #else
 int32_t jrt_load_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 int32_t jrt_jni_ii_aii(const void *s, int32_t a, void *b, int32_t c, int32_t d) { (void)s; (void)a; (void)b; (void)c; (void)d; return -1; }
+int32_t jrt_native_load(const void *a) { (void)a; return -1; }
+int64_t jrt_native_sym(const void *a) { (void)a; return 0; }
+int64_t jrt_ffi_call(int64_t a, const void *b, int32_t c, void *d) { (void)a; (void)b; (void)c; (void)d; return 0; }
 int32_t jrt_load_jar_and_run(const void *jstr) { (void)jstr; return -100; /* needs --dynamic */ }
 #endif
 

@@ -309,7 +309,9 @@ fn main() {
         // --dynamic keeps the whole runtime (a loaded module may resolve helpers
         // the host never calls itself) and exports jrt_* + libdl for dlopen.
         if dynamic {
-            cmd.args(["-rdynamic", "-ldl", "-DFASTLLVM_DYNAMIC"]);
+            // -lffi: the general native-call bridge (jrt_ffi_call) uses libffi to
+            // invoke arbitrary C signatures — the FFI a JNI/LWJGL-style layer needs.
+            cmd.args(["-rdynamic", "-ldl", "-lffi", "-DFASTLLVM_DYNAMIC"]);
             // Phase 5: patchable function entries so host methods can be redirected
             // in place by jrt_hotpatch (binary trampoline patching).
             cmd.arg("-fpatchable-function-entry=16");
