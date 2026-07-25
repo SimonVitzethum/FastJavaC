@@ -2677,6 +2677,163 @@ int32_t jrt_hotpatch_method(const void *t, const void *s, const void *g) {
 }
 #endif
 
+/* ==== Tier-1 copy-and-patch JIT (roadmap §2): JVM bytecode -> native at runtime ====
+ * Compiles a method's bytecode to x86-64 by emitting one stencil per opcode — no
+ * assembler, no LLVM, no subprocess. The JVM operand stack IS the machine stack;
+ * locals are an int64 array in RDI; RAX/RCX scratch; RDI preserved. A method is a leaf
+ * `int32_t fn(int64_t *locals)`. Integer subset (arith, locals, branches, loops). This
+ * is the in-binary engine validated standalone in spikes/jit_engine.c. */
+#if defined(FASTLLVM_DYNAMIC) && !defined(FASTLLVM_FREESTANDING) && (defined(__x86_64__) || defined(_M_X64))
+#include <stdlib.h>
+
+static unsigned char JIT_CODE[1 << 16];
+static int JIT_LEN;
+static int JIT_NOFF[1 << 16];
+typedef struct { int off, target_pc; } JitFix;
+static JitFix JIT_FIX[4096];
+static int JIT_NFIX;
+typedef int32_t (*jit_fn)(int64_t *);
+
+static void je1(unsigned char b) { JIT_CODE[JIT_LEN++] = b; }
+static void jeN(const void *p, int n) { memcpy(JIT_CODE + JIT_LEN, p, (size_t)n); JIT_LEN += n; }
+static void je_i32(int32_t v) { jeN(&v, 4); }
+static void je_push_local(int i) { je1(0xFF); je1(0x77); je1((unsigned char)(8 * i)); }
+static void je_pop_local(int i) { je1(0x8F); je1(0x47); je1((unsigned char)(8 * i)); }
+static void je_push_imm(int32_t v) { je1(0x68); je_i32(v); }
+static void je_jcc(unsigned char cc, int tpc) { je1(0x0F); je1(cc); JIT_FIX[JIT_NFIX].off = JIT_LEN; JIT_FIX[JIT_NFIX].target_pc = tpc; JIT_NFIX++; je_i32(0); }
+static void je_jmp(int tpc) { je1(0xE9); JIT_FIX[JIT_NFIX].off = JIT_LEN; JIT_FIX[JIT_NFIX].target_pc = tpc; JIT_NFIX++; je_i32(0); }
+static int16_t je_s16(const uint8_t *b) { return (int16_t)((b[0] << 8) | b[1]); }
+
+static jit_fn jit_compile_bc(const uint8_t *bc, int n) {
+    if (n <= 0 || n >= (1 << 16)) return NULL;
+    JIT_LEN = 0; JIT_NFIX = 0;
+    for (int i = 0; i <= n; i++) JIT_NOFF[i] = -1;
+    static const unsigned char CC[] = {0x84, 0x85, 0x8C, 0x8D, 0x8F, 0x8E}; /* eq ne lt ge gt le */
+    int pc = 0;
+    while (pc < n) {
+        JIT_NOFF[pc] = JIT_LEN;
+        uint8_t op = bc[pc];
+        switch (op) {
+            case 0x02: je_push_imm(-1); pc++; break;
+            case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: je_push_imm(op - 0x03); pc++; break;
+            case 0x10: je_push_imm((int8_t)bc[pc + 1]); pc += 2; break;
+            case 0x11: je_push_imm(je_s16(bc + pc + 1)); pc += 3; break;
+            case 0x15: je_push_local(bc[pc + 1]); pc += 2; break;
+            case 0x1a: case 0x1b: case 0x1c: case 0x1d: je_push_local(op - 0x1a); pc++; break;
+            case 0x36: je_pop_local(bc[pc + 1]); pc += 2; break;
+            case 0x3b: case 0x3c: case 0x3d: case 0x3e: je_pop_local(op - 0x3b); pc++; break;
+            case 0x60: je1(0x58); jeN("\x01\x04\x24", 3); pc++; break;               /* iadd */
+            case 0x64: je1(0x58); jeN("\x29\x04\x24", 3); pc++; break;               /* isub */
+            case 0x68: je1(0x58); jeN("\x0F\xAF\x04\x24", 4); jeN("\x89\x04\x24", 3); pc++; break; /* imul */
+            case 0x74: jeN("\xF7\x1C\x24", 3); pc++; break;                          /* ineg */
+            case 0x84: { int idx = bc[pc + 1]; int32_t c = (int8_t)bc[pc + 2]; je1(0x81); je1(0x47); je1((unsigned char)(8 * idx)); je_i32(c); pc += 3; break; } /* iinc */
+            case 0x59: jeN("\xFF\x34\x24", 3); pc++; break;                          /* dup */
+            case 0x57: jeN("\x48\x83\xC4\x08", 4); pc++; break;                      /* pop */
+            case 0xa7: je_jmp(pc + je_s16(bc + pc + 1)); pc += 3; break;             /* goto */
+            case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e:        /* if<cond> vs 0 */
+                je1(0x58); jeN("\x85\xC0", 2); je_jcc(CC[op - 0x99], pc + je_s16(bc + pc + 1)); pc += 3; break;
+            case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:        /* if_icmp<cond> */
+                je1(0x58); je1(0x59); jeN("\x39\xC1", 2); je_jcc(CC[op - 0x9f], pc + je_s16(bc + pc + 1)); pc += 3; break;
+            case 0xac: je1(0x58); je1(0xC3); pc++; break;                            /* ireturn */
+            default: return NULL; /* unsupported opcode */
+        }
+        if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
+    }
+    JIT_NOFF[n] = JIT_LEN;
+    for (int i = 0; i < JIT_NFIX; i++) {
+        int tpc = JIT_FIX[i].target_pc;
+        if (tpc < 0 || tpc > n || JIT_NOFF[tpc] < 0) return NULL;
+        int32_t rel = JIT_NOFF[tpc] - (JIT_FIX[i].off + 4);
+        memcpy(JIT_CODE + JIT_FIX[i].off, &rel, 4);
+    }
+    void *mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return NULL;
+    memcpy(mem, JIT_CODE, (size_t)JIT_LEN);
+    __builtin___clear_cache((char *)mem, (char *)mem + JIT_LEN);
+    return (jit_fn)mem;
+}
+
+/* Minimal .class locator: find method (name+desc) and return its Code bytecode. */
+static uint16_t cf_be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+static uint32_t cf_be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+static int cf_utf8eq(const uint8_t *s, int len, const char *c) {
+    for (int i = 0; i < len; i++) { if (!c[i] || s[i] != (uint8_t)c[i]) return 0; }
+    return c[len] == '\0';
+}
+static const uint8_t *cf_find_code(const uint8_t *f, long flen, const char *mname, const char *mdesc, int *out_len) {
+    if (flen < 10 || cf_be32(f) != 0xCAFEBABEu) return NULL;
+    uint16_t cpc = cf_be16(f + 8);
+    const uint8_t **u = (const uint8_t **)calloc(cpc, sizeof(void *));
+    int *ul = (int *)calloc(cpc, sizeof(int));
+    if (!u || !ul) { free(u); free(ul); return NULL; }
+    const uint8_t *p = f + 10;
+    for (int i = 1; i < cpc; i++) {
+        uint8_t tag = *p++;
+        switch (tag) {
+            case 1: { int len = cf_be16(p); u[i] = p + 2; ul[i] = len; p += 2 + len; } break;
+            case 7: case 8: case 16: case 19: case 20: p += 2; break;
+            case 15: p += 3; break;
+            case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18: p += 4; break;
+            case 5: case 6: p += 8; i++; break; /* long/double occupy two slots */
+            default: free(u); free(ul); return NULL;
+        }
+    }
+    p += 6;                                   /* access, this, super */
+    p += 2 + 2 * cf_be16(p);                  /* interfaces */
+    uint16_t fc = cf_be16(p); p += 2;         /* fields */
+    for (int i = 0; i < fc; i++) { p += 6; uint16_t ac = cf_be16(p); p += 2; for (int a = 0; a < ac; a++) { uint32_t al = cf_be32(p + 2); p += 6 + al; } }
+    uint16_t mc = cf_be16(p); p += 2;         /* methods */
+    const uint8_t *code = NULL;
+    for (int i = 0; i < mc && !code; i++) {
+        p += 2; uint16_t ni = cf_be16(p); p += 2; uint16_t di = cf_be16(p); p += 2;
+        uint16_t ac = cf_be16(p); p += 2;
+        int match = ni < cpc && di < cpc && cf_utf8eq(u[ni], ul[ni], mname) && cf_utf8eq(u[di], ul[di], mdesc);
+        for (int a = 0; a < ac; a++) {
+            uint16_t an = cf_be16(p); uint32_t al = cf_be32(p + 2); const uint8_t *body = p + 6;
+            if (match && an < cpc && cf_utf8eq(u[an], ul[an], "Code")) { *out_len = (int)cf_be32(body + 4); code = body + 8; }
+            p += 6 + al;
+        }
+    }
+    free(u); free(ul);
+    return code;
+}
+
+/* JIT-run a method of a .class file with one int arg (for (I)I methods). Reads the class
+ * at runtime, extracts the method bytecode, copy-and-patch-compiles it, and calls it.
+ * No AOT of that method, no subprocess — a genuine in-process Tier-1 JIT. */
+int32_t jrt_jit_run(const void *path_j, const void *mname_j, const void *mdesc_j, int32_t arg) {
+    char path[4096], mname[256], mdesc[256];
+    jstr_to_cstr(path_j, path, sizeof path);
+    jstr_to_cstr(mname_j, mname, sizeof mname);
+    jstr_to_cstr(mdesc_j, mdesc, sizeof mdesc);
+    if (!path[0] || !mname[0] || !mdesc[0]) return -1;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -2;
+    fseek(fp, 0, SEEK_END); long flen = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (flen <= 0 || flen > (16 << 20)) { fclose(fp); return -3; }
+    uint8_t *buf = (uint8_t *)malloc((size_t)flen);
+    if (!buf) { fclose(fp); return -4; }
+    if (fread(buf, 1, (size_t)flen, fp) != (size_t)flen) { free(buf); fclose(fp); return -5; }
+    fclose(fp);
+
+    int codelen = 0;
+    const uint8_t *code = cf_find_code(buf, flen, mname, mdesc, &codelen);
+    if (!code || codelen <= 0) { free(buf); return -6; }
+    jit_fn fn = jit_compile_bc(code, codelen);
+    free(buf); /* bytecode already copied into the JITted page */
+    if (!fn) return -7;
+
+    int64_t locals[64] = {0};
+    locals[0] = arg;
+    return fn(locals);
+}
+#else
+int32_t jrt_jit_run(const void *a, const void *b, const void *c, int32_t d) {
+    (void)a; (void)b; (void)c; (void)d; return -100; /* needs --dynamic on x86-64 */
+}
+#endif
+
 /* ---- M1: load a native module (.so) and run its entry point ----------------
  * dlopen the module (RTLD_LOCAL so its own symbols stay private; its undefined
  * jrt_* references resolve against this host, which is linked -rdynamic), verify

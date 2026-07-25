@@ -2774,6 +2774,9 @@ fn lower_block(
                         // class's impl by binary trampoline patching (affects all
                         // callers of the symbol, not just virtual dispatch).
                         ("__fjc_hotpatch", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I") => ("jrt_hotpatch_method", 3),
+                        // Tier-1 JIT: read a .class at runtime, copy-and-patch-compile the
+                        // named (I)I method to native code, and run it with one int arg.
+                        ("__fjc_jit_run", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)I") => ("jrt_jit_run", 4),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();
