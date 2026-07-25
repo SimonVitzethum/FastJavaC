@@ -2777,6 +2777,14 @@ fn lower_block(
                         // Tier-1 JIT: read a .class at runtime, copy-and-patch-compile the
                         // named (I)I method to native code, and run it with one int arg.
                         ("__fjc_jit_run", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)I") => ("jrt_jit_run", 4),
+                        // defineClass path: JIT bytecode that lives only in memory.
+                        // Raw method bytecode blob (what a runtime bytecode generator emits):
+                        ("__fjc_jit_raw", "([BI)I") => ("jrt_jit_raw", 2),
+                        // A full in-memory class file (the defineClass(byte[]) input):
+                        ("__fjc_define_and_run", "([BLjava/lang/String;Ljava/lang/String;I)I") => ("jrt_define_and_run", 4),
+                        // Helpers to load a class file into a Java byte[] (host-allocated):
+                        ("__fjc_file_size", "(Ljava/lang/String;)I") => ("jrt_file_size", 1),
+                        ("__fjc_read_into", "([BLjava/lang/String;)I") => ("jrt_read_into", 2),
                         _ => return Err(FrontendError::Unsupported(format!("unknown intrinsic {name}{desc}"))),
                     };
                     let mut args: Vec<Operand> = Vec::new();
