@@ -172,8 +172,15 @@ built to the reachable set, not the whole JDK.
 3. **Full `invokedynamic`/`MethodHandles`** → real lambdas/string-concat/`VarHandle`.
 4. **Copy-and-patch JIT (Tier 1) + `ClassLoader.defineClass`** (§2, §6) → build the
    AOT stencil library, then run a program that generates a class with ASM at runtime and
-   invokes it — stencil-compiled on first call, native, low-RAM. (First: a stencil-JIT
-   spike that compiles one hand-built method and runs it, to validate compile-time & size.)
+   invokes it — stencil-compiled on first call, native, low-RAM.
+   *Status: STARTED.* An integer-subset copy-and-patch JIT is integrated into the runtime
+   (`jrt_jit_run` in `runtime.c`, engine `spikes/jit_engine.c`, test `tests/jit.sh`): a
+   `--dynamic` binary reads a `.class` at runtime, extracts a method's bytecode with a
+   minimal in-C classfile parser, copy-and-patch-compiles it to native x86-64, and runs it
+   (incl. loops/branches) — no AOT of that method, no subprocess. Remaining for this
+   milestone: the full per-bytecode stencil set (objects/calls/longs/floats/exceptions),
+   the `defineClass(byte[])` entry (JIT from in-memory bytes, not just a file), and object
+   arguments/returns.
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
