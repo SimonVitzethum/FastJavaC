@@ -88,6 +88,27 @@ reachable through **~387 interface functions that are mostly thin adapters onto 
 fastjavac already has**. The deep minority is unavoidable JVM work either way — the bridge just
 concentrates it in one well-specified table instead of scattering it across per-class leaves.
 
+## Prototype — proven end-to-end (spikes/jni_bridge.{c,sh})
+
+A working spike calls **real JDK native leaves** through the bridge, on this machine:
+
+- **The dependency wall is real** (as predicted): `libzip.so` has `NEEDED libjava.so`,
+  which imports **159 versioned `SUNWprivate_1.1` symbols** (`JVM_*` + `jio_*`) from
+  `libjvm.so`. You cannot `dlopen` a single leaf lib without providing that whole interface.
+- **The bridge clears it**: a generated `libjvm.so` stubbing all 159 versioned symbols (+ a
+  `libjava.so` stubbing the ~6 `JNU_*`/`jio_*` helpers `libzip` imports), `LD_PRELOAD`ed so
+  `libzip`'s `NEEDED` resolve to ours. Then:
+  - `Java_java_util_zip_CRC32_update` (pure leaf) → `crc32("hello") = 907060870`.
+  - `Java_java_util_zip_CRC32_updateBytes0` (array leaf) → same, via a **minimal JNIEnv**
+    (3 slots: `GetPrimitiveArrayCritical`/`Release`/`GetArrayLength`) that hands the JDK code
+    a **fastjavac array object** (`obj + 32` = data). Both equal `zlib.crc32`.
+
+So the concept holds concretely: with the versioned `JVM_*` table + a per-need JNIEnv over
+fastjavac's layout, the JDK's own compiled native leaves run unmodified. The 159 stubs return
+`NULL` here (CRC32's path never calls them); a real integration implements the reachable
+subset — most as thin adapters onto fastjavac's runtime (registry, RC, arraycopy, monitors).
+Run it: `sh spikes/jni_bridge.sh`.
+
 ## Relation to the JIT-completeness question
 
 Complete Tier-1 JIT (all bytecodes) + this native bridge are the two finite halves:
