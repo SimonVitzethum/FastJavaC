@@ -197,22 +197,25 @@ built to the reachable set, not the whole JDK.
    (`tests/jitvirtual.sh`): a JIT-defined method dispatches through the receiver's runtime
    vtable, and open-world builds keep all virtual methods as roots so their vtable slots
    aren't pruned to null.
-   **Two concrete blockers remain for full JIT-defined *polymorphic classes* (the mod/Mixin
-   pattern — a JIT-defined class extending an AOT/game class, overriding methods that the
-   game then calls virtually). Both were prototyped this session and reverted pending fixes:**
-   1. **JIT-side reference counting.** JITted code emits no retain/release, so any object a
-      JITted method `new`s and keeps in a local leaks (breaks the 0-live-heap oracle). Needs
-      a lightweight RC pass: track reference-typed locals (via astore) and release them at
-      each return (retain the areturn value; never release borrowed params).
-   2. **JIT↔AOT calling-convention unification.** JITted methods use a locals-array-in-RDI
-      ABI; AOT methods use native args-in-registers. A JIT→AOT call, or an AOT vtable slot
-      overridden by a JIT method and called by AOT code, mismatches unless the AOT side
-      ignores `this`/args. Needs a shared ABI (JIT emits native-arg prologues) or boundary
-      thunks. (The prototype worked because its constructors touched no fields.)
-   Also remaining: array creation/access (newarray/anewarray/*aload/*astore), call-site
-   alignment for AOT SSE targets, and full exception semantics (uncaught propagation,
-   per-pc stack-depth reset, type-narrowed catches). Blockers (1) and (2) are the critical
-   path to running actual mod-style code.
+   **Both prior blockers for mod-style code are now solved for the common case:**
+   1. **JIT-side reference counting — DONE** (`tests/jitrc.sh`). The JIT prologue holds the
+      locals base in RBX (callee-saved, so C calls preserve it); a compile-time ownership
+      model marks only `new` results as owned; owned ref-locals are released at
+      ireturn/lreturn/return. So a JITted method that `new`s objects no longer leaks (0-live
+      oracle holds). Conservative — never over-releases.
+   2. **JIT↔AOT native calling convention — DONE for AOT callees** (`tests/jitabi.sh`).
+      JIT→AOT calls (invokestatic/special/virtual) marshal <=6 int/ref args into the native
+      registers (arg0→RDI…), so AOT methods/constructors that use `this` or read/write fields
+      get the correct receiver. FjcMethod flag bit2 tags JIT-defined (locals-array) vs AOT
+      (native) callees. Combined with (1), the mod-critical chain works end to end: a JITted
+      method `new`s an object, its AOT constructor sets a field via the correct `this`, a
+      virtual getter reads it, and the object is RC-freed — heap balances.
+   Remaining (narrower): float/double call args (xmm register classes), >6 args (stack),
+   and the *reverse* AOT→JIT direction — a JIT-defined override installed in an AOT vtable
+   slot, called by AOT code — which needs JIT methods to also have native-arg entry
+   prologues (the last step for fully JIT-defined polymorphic subclasses). Also: array
+   creation/access, and full exception semantics (uncaught propagation, per-pc stack-depth
+   reset, type-narrowed catches).
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
