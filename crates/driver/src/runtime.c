@@ -338,6 +338,9 @@ static void jrt_sb_drop(void *p);
  * generated code as @vt.java_lang_String; @main sets this pointer at startup.
  * String literals reference the same vtable directly. */
 void *jrt_dyn_string_vt = NULL;
+/* Array vtables published by @main (dynamic builds) so JITted code can allocate arrays. */
+void *jrt_array_int_vt = NULL;
+void *jrt_array_ref_vt = NULL;
 
 /* --- Output ---------------------------------------------------------- */
 
@@ -2809,6 +2812,10 @@ static void jvm_delta(uint8_t op, const uint8_t *bc, int pc, const CpInfo *cp, i
         case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x15 ... 0x19: case 0x1a ... 0x2d:
         case 0x59: *pushes = 1; break;                                   /* consts/loads/dup */
         case 0xbb: *pushes = 1; *owned = 1; break;                       /* new -> owned */
+        case 0xbc: case 0xbd: *pops = 1; *pushes = 1; *owned = 1; break; /* newarray/anewarray (count->array, owned) */
+        case 0xbe: *pops = 1; *pushes = 1; break;                        /* arraylength */
+        case 0x2e: case 0x32: *pops = 2; *pushes = 1; break;             /* iaload/aaload */
+        case 0x4f: case 0x53: *pops = 3; break;                          /* iastore/aastore */
         case 0x36 ... 0x4e: case 0x57: *pops = 1; break;                 /* stores / pop */
         case 0x60: case 0x61: case 0x63 ... 0x65: case 0x67 ... 0x69: case 0x6b: case 0x6f:
             *pops = 2; *pushes = 1; break;                               /* binary arith */
@@ -2861,6 +2868,14 @@ static int desc_has_fp_args(const char *d) {
     return 0;
 }
 
+/* Array helpers (defined later) the JIT calls for load/store/alloc. */
+int32_t jrt_iaload(void *, int32_t);
+void jrt_iastore(void *, int32_t, int32_t);
+void *jrt_aaload(void *, int32_t);
+void jrt_aastore(void *, int32_t, void *);
+void *jrt_new_prim_array(int32_t, int32_t);
+void *jrt_new_ref_array(int32_t);
+
 /* Marshal K (<=6) integer/reference operand-stack args into the native argument
  * registers (arg0->RDI ... arg5->R9). arg0 is deepest ([rsp+8*(K-1)]), argK-1 at [rsp]. */
 static void emit_native_marshal(int K) {
@@ -2869,6 +2884,19 @@ static void emit_native_marshal(int K) {
         "\x48\x8B\x8C\x24", "\x4C\x8B\x84\x24", "\x4C\x8B\x8C\x24", /* rcx r8  r9  */
     };
     for (int i = 0; i < K; i++) { jeN(movs[i], 4); je_i32(8 * (K - 1 - i)); }
+}
+
+/* Native-call a runtime helper `fn` with `nargs` int/ref operand-stack args; pop them and
+ * (optionally) push the return value. */
+static void emit_call_jrt(const void *fn, int nargs, int push_result) {
+    emit_native_marshal(nargs);
+    jeN("\x48\x89\xE5", 3);                        /* mov rbp, rsp */
+    jeN("\x48\x83\xE4\xF0", 4);                    /* and rsp, -16 */
+    je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)fn); /* mov rax, fn */
+    jeN("\xFF\xD0", 2);                            /* call rax */
+    jeN("\x48\x89\xEC", 3);                        /* mov rsp, rbp */
+    if (nargs > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * nargs); } /* pop args */
+    if (push_result) je1(0x50);                    /* push rax */
 }
 
 static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc, const CpInfo *cp) {
@@ -2991,6 +3019,31 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 je_jmp(handler); pc++; break;
             }
             case 0xc0: pc += 3; break; /* checkcast: trusted no-op (leaves the ref) */
+            /* --- arrays (int + reference; via runtime helpers, which bounds-check) --- */
+            case 0xbc: { /* newarray <atype>: only int (10) supported here */
+                int elem = bc[pc + 1] == 10 ? 4 : bc[pc + 1] == 11 ? 8 : bc[pc + 1] == 6 ? 4 : -1;
+                if (elem < 0) return NULL; /* narrow/other prim arrays not yet JITted */
+                jeN("\x48\x8B\x3C\x24", 4);                /* mov rdi, [rsp] (count) */
+                je1(0xBE); je_i32(elem);                   /* mov esi, elem_size */
+                jeN("\x48\x89\xE5", 3); jeN("\x48\x83\xE4\xF0", 4);
+                je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)&jrt_new_prim_array);
+                jeN("\xFF\xD0", 2); jeN("\x48\x89\xEC", 3);
+                je1(0x48); je1(0x83); je1(0xC4); je1(0x08); /* add rsp,8 (pop count) */
+                je1(0x50); pc += 2; break;                 /* push array */
+            }
+            case 0xbd: { /* anewarray <class>: reference array */
+                jeN("\x48\x8B\x3C\x24", 4);                /* mov rdi, [rsp] (count) */
+                jeN("\x48\x89\xE5", 3); jeN("\x48\x83\xE4\xF0", 4);
+                je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)&jrt_new_ref_array);
+                jeN("\xFF\xD0", 2); jeN("\x48\x89\xEC", 3);
+                je1(0x48); je1(0x83); je1(0xC4); je1(0x08); /* add rsp,8 (pop count) */
+                je1(0x50); pc += 3; break;                 /* push array */
+            }
+            case 0xbe: je1(0x58); jeN("\x8B\x40\x10", 3); je1(0x50); pc++; break; /* arraylength: pop rax; mov eax,[rax+16]; push */
+            case 0x2e: emit_call_jrt((const void *)&jrt_iaload, 2, 1); pc++; break;  /* iaload */
+            case 0x4f: emit_call_jrt((const void *)&jrt_iastore, 3, 0); pc++; break; /* iastore */
+            case 0x32: emit_call_jrt((const void *)&jrt_aaload, 2, 1); pc++; break;  /* aaload */
+            case 0x53: emit_call_jrt((const void *)&jrt_aastore, 3, 0); pc++; break; /* aastore */
             /* --- field access (offset resolved against the FjcClass registry) --- */
             case 0xb4: { /* getfield: pop objref; load field; push */
                 int off, wide;
@@ -3852,6 +3905,15 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
     a->length = count;
     a->elem_size = elem_size;
     return p;
+}
+
+/* JIT array allocation: use the array vtables published by @main. A primitive array uses
+ * the no-op drop/trace vtable; a reference array uses the ref-tracing one. */
+void *jrt_new_prim_array(int32_t count, int32_t elem_size) {
+    return jrt_alloc_array(count, elem_size, jrt_array_int_vt);
+}
+void *jrt_new_ref_array(int32_t count) {
+    return jrt_alloc_array(count, 8, jrt_array_ref_vt);
 }
 
 void jrt_bounds_check(const void *arr, int32_t index) {
