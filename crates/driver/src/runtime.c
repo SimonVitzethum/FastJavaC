@@ -3955,6 +3955,68 @@ static void *jni_bridge_newstringutf(void *env, const char *c) {
     return s;
 }
 
+/* --- General field access via the FjcClass registry --- so ANY JNI native that
+ * reads/writes object fields works (GetFieldID → byte offset; Get/Set<T>Field →
+ * access at obj+offset). Maps directly onto fastjavac's object layout
+ * ({refcount@0, vtable@8, fields…}); sub-int fields are stored as i32. */
+static const FjcClass *jni_class_by_vtable(const void *vt) {
+    if (!vt) return NULL;
+    for (uint32_t i = 0; i < fjc_classes_len; i++)
+        if (fjc_classes[i] && fjc_classes[i]->vtable == vt) return fjc_classes[i];
+    for (uint32_t m = 0; m < fjc_modules_len; m++)
+        for (uint32_t i = 0; i < fjc_modules[m].len; i++)
+            if (fjc_modules[m].classes[i] && fjc_modules[m].classes[i]->vtable == vt)
+                return fjc_modules[m].classes[i];
+    return NULL;
+}
+static void *jni_bridge_findclass(void *env, const char *name) {
+    (void)env;
+    if (!name) return NULL;
+    char dotted[512]; int i = 0;
+    for (; name[i] && i < 511; i++) dotted[i] = name[i] == '/' ? '.' : name[i];
+    dotted[i] = '\0';
+    return (void *)jrt_class_by_name(dotted);
+}
+static void *jni_bridge_getobjectclass(void *env, void *obj) {
+    (void)env;
+    if (!obj) return NULL;
+    return (void *)jni_class_by_vtable(*(void **)((char *)obj + 8));   /* vtable @ +8 */
+}
+static void *jni_bridge_getsuperclass(void *env, void *cls) {
+    (void)env; return cls ? (void *)((const FjcClass *)cls)->super : NULL;
+}
+static void *jni_bridge_getfieldid(void *env, void *cls, const char *name, const char *sig) {
+    (void)env; (void)sig;
+    const FjcClass *c = (const FjcClass *)cls;
+    while (c) {
+        for (uint32_t i = 0; i < c->n_fields; i++)
+            if (jrt_cstreq(c->fields[i].name, name))
+                return (void *)(intptr_t)c->fields[i].offset;   /* offset ≥ 16, never 0 */
+        c = c->super;
+    }
+    return NULL;
+}
+#define FLD(o, f) ((char *)(o) + (intptr_t)(f))
+static int32_t jni_bridge_getintfield(void *e, void *o, void *f)  { (void)e; return *(int32_t *)FLD(o, f); }
+static void    jni_bridge_setintfield(void *e, void *o, void *f, int32_t v) { (void)e; *(int32_t *)FLD(o, f) = v; }
+static int64_t jni_bridge_getlongfield(void *e, void *o, void *f) { (void)e; return *(int64_t *)FLD(o, f); }
+static void    jni_bridge_setlongfield(void *e, void *o, void *f, int64_t v){ (void)e; *(int64_t *)FLD(o, f) = v; }
+static float   jni_bridge_getfloatfield(void *e, void *o, void *f){ (void)e; return *(float *)FLD(o, f); }
+static void    jni_bridge_setfloatfield(void *e, void *o, void *f, float v) { (void)e; *(float *)FLD(o, f) = v; }
+static double  jni_bridge_getdoublefield(void *e, void *o, void *f){(void)e; return *(double *)FLD(o, f); }
+static void    jni_bridge_setdoublefield(void *e, void *o, void *f, double v){(void)e; *(double *)FLD(o, f) = v; }
+/* sub-int fields are stored as i32; read/truncate, write full width */
+static int32_t jni_bridge_getbytefield(void *e, void *o, void *f) { (void)e; return (int8_t)*(int32_t *)FLD(o, f); }
+static void    jni_bridge_setbytefield(void *e, void *o, void *f, int32_t v){ (void)e; *(int32_t *)FLD(o, f) = (int8_t)v; }
+static int32_t jni_bridge_getshortfield(void *e, void *o, void *f){ (void)e; return (int16_t)*(int32_t *)FLD(o, f); }
+static void    jni_bridge_setshortfield(void *e, void *o, void *f, int32_t v){(void)e; *(int32_t *)FLD(o, f) = (int16_t)v; }
+static int32_t jni_bridge_getcharfield(void *e, void *o, void *f) { (void)e; return (uint16_t)*(int32_t *)FLD(o, f); }
+static void    jni_bridge_setcharfield(void *e, void *o, void *f, int32_t v){ (void)e; *(int32_t *)FLD(o, f) = (uint16_t)v; }
+static void   *jni_bridge_getobjectfield(void *e, void *o, void *f){(void)e; void *v = *(void **)FLD(o, f); jrt_retain(v); return v; }
+static void    jni_bridge_setobjectfield(void *e, void *o, void *f, void *v){ (void)e; void **p = (void **)FLD(o, f); jrt_retain(v); void *old = *p; *p = v; jrt_release(old); }
+#undef FLD
+static int32_t jni_bridge_getversion(void *e) { (void)e; return 0x00010008; }   /* JNI 1.8 */
+
 static void *jni_table[236];                 /* JNINativeInterface_ slot count */
 static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
 static int jni_ready;                        /* 0 unknown, 1 ok, -1 unavailable */
@@ -4014,6 +4076,30 @@ static void jni_env_setup(void) {
     jni_table[170] = (void *)jni_bridge_releasestringutf;
     jni_table[222] = (void *)jni_bridge_get_critical;
     jni_table[223] = (void *)jni_bridge_release_critical;
+    /* class + field access (general — any JNI native reading/writing fields) */
+    jni_table[4]   = (void *)jni_bridge_getversion;
+    jni_table[6]   = (void *)jni_bridge_findclass;
+    jni_table[10]  = (void *)jni_bridge_getsuperclass;
+    jni_table[31]  = (void *)jni_bridge_getobjectclass;
+    jni_table[94]  = (void *)jni_bridge_getfieldid;
+    jni_table[95]  = (void *)jni_bridge_getobjectfield;
+    jni_table[96]  = (void *)jni_bridge_getintfield;    /* boolean stored as i32 */
+    jni_table[97]  = (void *)jni_bridge_getbytefield;
+    jni_table[98]  = (void *)jni_bridge_getcharfield;
+    jni_table[99]  = (void *)jni_bridge_getshortfield;
+    jni_table[100] = (void *)jni_bridge_getintfield;
+    jni_table[101] = (void *)jni_bridge_getlongfield;
+    jni_table[102] = (void *)jni_bridge_getfloatfield;
+    jni_table[103] = (void *)jni_bridge_getdoublefield;
+    jni_table[104] = (void *)jni_bridge_setobjectfield;
+    jni_table[105] = (void *)jni_bridge_setintfield;    /* boolean */
+    jni_table[106] = (void *)jni_bridge_setbytefield;
+    jni_table[107] = (void *)jni_bridge_setcharfield;
+    jni_table[108] = (void *)jni_bridge_setshortfield;
+    jni_table[109] = (void *)jni_bridge_setintfield;
+    jni_table[110] = (void *)jni_bridge_setlongfield;
+    jni_table[111] = (void *)jni_bridge_setfloatfield;
+    jni_table[112] = (void *)jni_bridge_setdoublefield;
     jni_table_ptr = jni_table;
 }
 
