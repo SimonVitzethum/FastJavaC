@@ -34,6 +34,13 @@ public class JitArith {
         int b = (n instanceof Widget) ? 8 : 0;   // null  -> 0
         return a + b;
     }
+    static int t_static(int x) {                                     // getstatic/putstatic -> 318 for x=6
+        Stats.sum = x + 100;             // putstatic int
+        int a = Stats.sum;               // getstatic int  -> 106
+        Stats.big = a * 2;               // putstatic long (i2l)
+        long b = Stats.big;              // getstatic long -> 212
+        return a + (int) b;              // 106 + 212 = 318
+    }
     // Division by zero must NOT crash (no CPU #DE): the checked leaf throws an
     // ArithmeticException (pending) and yields 0, so 42 is printed before the
     // exception surfaces at the host boundary.

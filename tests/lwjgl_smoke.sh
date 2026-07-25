@@ -24,7 +24,15 @@ public final class Library { public static void initialize() {} }
 J
 cat > "$work/stub/org/lwjgl/system/Checks.java" <<'J'
 package org.lwjgl.system;
-public final class Checks { public static final boolean CHECKS = false; public static final boolean DEBUG = false; }
+// Stub of the LWJGL argument-checker. check(long) is referenced by MemoryAccessJNI's
+// accessor bodies; provided here so the closed world is complete (the FjcClass registry
+// now retains reachable methods for dynamic getstatic/putstatic, so getByte & friends
+// are no longer pruned and their call to check must resolve).
+public final class Checks {
+    public static final boolean CHECKS = false;
+    public static final boolean DEBUG = false;
+    public static long check(long a) { return a; }
+}
 J
 cat > "$work/stub/org/lwjgl/system/Smoke.java" <<'J'
 package org.lwjgl.system;

@@ -1021,6 +1021,31 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
                 (format!("@fjc.fields.{cs}"), field_entries.len())
             };
 
+            // static_fields[]: name, a width-proxy descriptor (leading char gives the
+            // load/store width), the @sf.* storage-global address, and is_ref. Lets the
+            // JIT compile getstatic/putstatic against dynamically loaded bytecode.
+            let mut sfield_entries: Vec<String> = Vec::new();
+            for f in &c.static_fields {
+                let name_sym = meta_str(&f.name, &mut str_defs, &mut str_map, &mut str_n);
+                let d = match f.ty {
+                    Ty::I64 => "J",
+                    Ty::F64 => "D",
+                    Ty::Ref => "Ljava/lang/Object;",
+                    Ty::F32 => "F",
+                    _ => "I",
+                };
+                let desc_sym = meta_str(d, &mut str_defs, &mut str_map, &mut str_n);
+                let addr = format!("@sf.{cs}.{}", sanitize(&f.name));
+                let is_ref = (f.ty == Ty::Ref) as u32;
+                sfield_entries.push(format!("{{ ptr, ptr, ptr, i32 }} {{ ptr {name_sym}, ptr {desc_sym}, ptr {addr}, i32 {is_ref} }}"));
+            }
+            let (sfields_ptr, n_sfields) = if sfield_entries.is_empty() {
+                ("null".to_string(), 0)
+            } else {
+                writeln!(body, "@fjc.sfields.{cs} = private unnamed_addr constant [{} x {{ ptr, ptr, ptr, i32 }}] [{}]", sfield_entries.len(), sfield_entries.join(", ")).unwrap();
+                (format!("@fjc.sfields.{cs}"), sfield_entries.len())
+            };
+
             // methods[]: declared methods, with native code pointer + vtable slot.
             let mut method_entries: Vec<String> = Vec::new();
             for m in &c.methods {
@@ -1098,9 +1123,10 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             // FjcClass: layout frozen under FJC_ABI_VERSION (see runtime.c mirror).
             writeln!(
                 body,
-                "@fjc.{cs} = internal constant {{ i32, i32, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, ptr, ptr, ptr, ptr }} \
+                "@fjc.{cs} = internal constant {{ i32, i32, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, ptr, ptr, ptr, ptr, i32, ptr }} \
                  {{ i32 {abi}, i32 {cflags}, ptr @cname.{cs}, ptr {super_ptr}, ptr {vt_ptr}, i32 {vt_len}, {size}, \
-                 i32 {n_if}, i32 {n_fields}, i32 {n_methods}, i32 {n_ref}, ptr {ifaces_ptr}, ptr {fields_ptr}, ptr {methods_ptr}, ptr {refoff_ptr} }}",
+                 i32 {n_if}, i32 {n_fields}, i32 {n_methods}, i32 {n_ref}, ptr {ifaces_ptr}, ptr {fields_ptr}, ptr {methods_ptr}, ptr {refoff_ptr}, \
+                 i32 {n_sfields}, ptr {sfields_ptr} }}",
                 abi = fastllvm_ir::FJC_ABI_VERSION,
             )
             .unwrap();

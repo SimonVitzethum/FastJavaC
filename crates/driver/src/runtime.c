@@ -2440,7 +2440,7 @@ int32_t jrt_record_memeq(void *a, void *b, int32_t inst, int64_t field_bytes) {
  * classes/methods by name at runtime. This is the substrate for dynamic module
  * loading (M1/M2). Bumping the layout/ordering requires bumping FJC_ABI_VERSION on
  * both sides. */
-#define FJC_ABI_VERSION 1
+#define FJC_ABI_VERSION 2
 
 typedef struct {
     const char *name;
@@ -2448,6 +2448,16 @@ typedef struct {
     uint32_t offset;    /* byte offset from object base */
     uint32_t is_ref;
 } FjcField;
+
+/* Static field: its runtime storage ADDRESS (the @sf.<class>.<field> global), so the
+ * JIT can compile getstatic/putstatic against dynamically loaded bytecode. `desc`'s
+ * leading char gives the load/store width (J/D/L/[ = 8 bytes, else 4). */
+typedef struct {
+    const char *name;
+    const char *desc;
+    void *addr;
+    uint32_t is_ref;
+} FjcStaticField;
 
 typedef struct {
     const char *name;
@@ -2473,6 +2483,8 @@ typedef struct FjcClass {
     const FjcField *fields;
     const FjcMethod *methods;
     const uint32_t *ref_offsets;
+    uint32_t n_static_fields;              /* ABI v2: static-field storage table */
+    const FjcStaticField *static_fields;
 } FjcClass;
 
 /* Emitted by the backend with external linkage (always present — the backend emits
@@ -2864,6 +2876,32 @@ static int jit_resolve_field(const CpInfo *cp, int fref, int *out_off, int *out_
     return 0;
 }
 
+/* Resolve a static Fieldref to its runtime storage address + load/store width. Walks the
+ * declaring class and its superclasses (a static field ref may name a subclass). Returns 1
+ * and the @sf.* global's address on success. */
+static int jit_resolve_static_field(const CpInfo *cp, int fref, void **out_addr, int *out_wide) {
+    if (!cp || !cp->ref_class || fref <= 0 || fref >= cp->cpc) return 0;
+    int ci = cp->ref_class[fref], ni = cp->ref_nat[fref];
+    if (ci <= 0 || ci >= cp->cpc || ni <= 0 || ni >= cp->cpc) return 0;
+    int cni = cp->cls_ni[ci], fni = cp->nat_name[ni];
+    if (cni <= 0 || cni >= cp->cpc || fni <= 0 || fni >= cp->cpc) return 0;
+    char dotted[256];
+    int cl = cp->ul[cni]; if (cl >= (int)sizeof dotted) return 0;
+    for (int i = 0; i < cl; i++) { char ch = (char)cp->u[cni][i]; dotted[i] = ch == '/' ? '.' : ch; }
+    dotted[cl] = '\0';
+    for (const FjcClass *c = jrt_class_by_name(dotted); c; c = c->super) {
+        for (uint32_t k = 0; k < c->n_static_fields; k++) {
+            if (cf_utf8eq(cp->u[fni], cp->ul[fni], c->static_fields[k].name)) {
+                *out_addr = c->static_fields[k].addr;
+                const char *d = c->static_fields[k].desc;
+                *out_wide = (d && (d[0] == 'J' || d[0] == 'D' || d[0] == 'L' || d[0] == '[')) ? 1 : 0;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* `exc` points at the method's exception_table entries (8 bytes each: start/end/handler/
  * catch_type, big-endian), `nexc` the count; NULL/0 if none. Used to dispatch athrow. */
 /* Resolve a Methodref cp index to the registered FjcMethod (whose `code` field holds the
@@ -2940,6 +2978,8 @@ static void jvm_delta(uint8_t op, const uint8_t *bc, int pc, const CpInfo *cp, i
         case 0x5a: *pops = 2; *pushes = 3; break;                        /* dup_x1 */
         case 0xc2: case 0xc3: *pops = 1; break;                          /* monitorenter/exit */
         case 0xb5: *pops = 2; break;                                     /* putfield */
+        case 0xb2: *pushes = 1; break;                                   /* getstatic */
+        case 0xb3: *pops = 1; break;                                     /* putstatic */
         case 0x99 ... 0x9e: case 0xc6: case 0xc7: case 0xac ... 0xb0: case 0xbf:
             *pops = 1; break;                                           /* if<0>/returns-value/athrow */
         case 0x9f ... 0xa6: *pops = 2; break;                           /* if_icmp/if_acmp */
@@ -3378,6 +3418,24 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x8a: je1(0x58); jeN("\xF2\x48\x0F\x2A\xC0", 5); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* l2d: cvtsi2sd xmm0,rax; movq rax,xmm0 */
             case 0x8c: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x48\x0F\x2C\xC0", 5); je1(0x50); pc++; break; /* f2l: movd xmm0,eax; cvttss2si rax,xmm0 */
             case 0x8f: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x48\x0F\x2C\xC0", 5); je1(0x50); pc++; break; /* d2l: movq xmm0,rax; cvttsd2si rax,xmm0 */
+            /* --- static field access (storage address resolved via the registry) --- */
+            case 0xb2: { /* getstatic: load a static field, push */
+                void *addr; int wide;
+                if (!jit_resolve_static_field(cp, (bc[pc + 1] << 8) | bc[pc + 2], &addr, &wide)) return NULL;
+                je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)addr); /* mov rax, addr */
+                if (wide) jeN("\x48\x8B\x00", 3); /* mov rax, [rax] */
+                else jeN("\x8B\x00", 2);          /* mov eax, [rax] (zero-ext) */
+                je1(0x50); pc += 3; break;        /* push rax */
+            }
+            case 0xb3: { /* putstatic: pop value, store into the static field */
+                void *addr; int wide;
+                if (!jit_resolve_static_field(cp, (bc[pc + 1] << 8) | bc[pc + 2], &addr, &wide)) return NULL;
+                je1(0x58);                                              /* pop rax (value) */
+                je1(0x48); je1(0xB9); je_i64((int64_t)(uintptr_t)addr); /* mov rcx, addr */
+                if (wide) jeN("\x48\x89\x01", 3); /* mov [rcx], rax */
+                else jeN("\x89\x01", 2);          /* mov [rcx], eax */
+                pc += 3; break;
+            }
             /* --- field access (offset resolved against the FjcClass registry) --- */
             case 0xb4: { /* getfield: pop objref; load field; push */
                 int off, wide;

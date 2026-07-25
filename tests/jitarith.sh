@@ -10,9 +10,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"; ex="$root/examples"; fastjavac="$root/
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 case "$(uname -m)" in x86_64|amd64) ;; *) echo "ok   jitarith (skipped: non-x86_64)"; exit 0;; esac
 [ -x "$fastjavac" ] || { echo "FAIL jitarith (fastjavac missing)"; exit 1; }
-if ! javac -d "$work" "$ex/JitArith.java" "$ex/JitArithHost.java" "$ex/Widget.java" 2>"$work/j"; then
+if ! javac -d "$work" "$ex/JitArith.java" "$ex/JitArithHost.java" "$ex/Widget.java" "$ex/Stats.java" 2>"$work/j"; then
     echo "FAIL jitarith (javac): $(head -1 "$work/j")"; exit 1; fi
-if ! "$fastjavac" --dynamic -o "$work/host" "$work/JitArithHost.class" "$work/Widget.class" 2>"$work/h"; then
+if ! "$fastjavac" --dynamic -o "$work/host" "$work/JitArithHost.class" "$work/Widget.class" "$work/Stats.class" 2>"$work/h"; then
     echo "FAIL jitarith (build): $(cat "$work/h")"; exit 1; fi
 out="$(cd "$work" && ./host 2>&1)"; code=$?
 # div-by-zero must surface as a thrown ArithmeticException, never a hardware fault.
@@ -27,6 +27,7 @@ t_da=6
 t_fcmp=1
 t_dcmp=1
 t_instof=4
+t_static=318
 t_divz=42"
 got="$(echo "$out" | grep '=')"
 [ "$got" = "$want" ] || { echo "FAIL jitarith (opcode mismatch):"; echo "$out"; exit 1; }

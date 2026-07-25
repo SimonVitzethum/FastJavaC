@@ -20,10 +20,11 @@ Status: 🟡 partial · ⬜ not started. (Done items are not listed.)
   can power these.
 - 🟡 **Tier-1 JIT: symbolic resolution + remaining opcodes** so it can compile *arbitrary*
   loaded bytecode (not just self-contained methods). This is the load-any-jar unlock.
-  - ⬜ `getstatic` / `putstatic` — needs the backend to publish static-field storage
-    addresses in the FjcClass registry (currently only instance-field offsets are there).
+  - ✅ `getstatic` / `putstatic` — the backend now publishes each static field's storage
+    address in the FjcClass registry (ABI v2 `static_fields[]` table); the JIT resolves the
+    `@sf.*` global and loads/stores it. (RC on ref statics is a plain store, like putfield.)
   - ✅ `instanceof` (resolves the class → vtable[2] TypeDesc → `jrt_instanceof` walk)
-  - ⬜ `invokedynamic` in the JIT (bootstrap)
+  - ⬜ `invokedynamic` in the JIT (bootstrap) — the last remaining JIT opcode gap
   - ✅ `idiv`/`irem`/`ldiv`/`lrem` (call the checked leaves — div-by-zero throws, no SIGFPE)
   - ✅ typed float/double arrays (`faload`/`daload`/`fastore`/`dastore` — raw-bit moves)
   - ✅ `fcmp`/`dcmp` (NaN l/g variants via the comparison leaves)

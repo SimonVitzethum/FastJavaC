@@ -10,6 +10,9 @@ public class JitArithHost {
         t("t_idiv", 6); t("t_irem", 6); t("t_ldiv", 6); t("t_lrem", 6);
         t("t_fa", 6); t("t_da", 6); t("t_fcmp", 6); t("t_dcmp", 6);
         t("t_instof", 6);
+        t("t_static", 6);
         t("t_divz", 0);   // must throw (pending), not SIGFPE
     }
+    // Reference Stats so it is AOT-compiled into this host (registry + @sf globals).
+    static { Stats.sum = 0; }
 }

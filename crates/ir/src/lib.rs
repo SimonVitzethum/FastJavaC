@@ -10,7 +10,7 @@ use std::fmt;
 /// `PHASE-0-PLAN.md` §2). The backend stamps this into every emitted `FjcClass`;
 /// `runtime.c` mirrors it as `FJC_ABI_VERSION` and the registry rejects any
 /// descriptor whose version disagrees. **Bump this on any layout/ordering change.**
-pub const FJC_ABI_VERSION: u32 = 1;
+pub const FJC_ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
