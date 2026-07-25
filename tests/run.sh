@@ -242,6 +242,7 @@ if sh "$root/tests/jitrc.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitabi.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitarr.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitfloat.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/jitmod.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitnew.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 
 echo "---"
