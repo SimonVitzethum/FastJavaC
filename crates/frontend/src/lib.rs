@@ -863,51 +863,64 @@ fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) ->
     Origin::Opaque
 }
 
-/// Route a `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe` Object-relative int/long
-/// memory-access method to its runtime helper + result type. Memory-order
-/// variants (Volatile/Acquire/Release/Opaque/Plain, `weak*`) all collapse to the
-/// seq_cst helper — conservative and correct on x86-64. Reference-typed accessors
-/// are intentionally excluded (a ref store needs an RC barrier — separate work);
-/// address-based (non-Object) forms are excluded via the leading-ref check.
+/// Route a `jdk.internal.misc.Unsafe`/`sun.misc.Unsafe` Object-relative
+/// int/long/reference memory-access method to its runtime helper + result type.
+/// Memory-order variants (Volatile/Acquire/Release/Opaque/Plain, `weak*`) all
+/// collapse to the seq_cst helper — conservative and correct on x86-64. The
+/// reference helpers carry the RC store barrier (retain new / release old).
+/// Address-based (non-Object) forms are excluded via the leading-ref check.
 fn unsafe_mem_route(name: &str, desc: &str) -> Option<(&'static str, Ty)> {
     let (ptys, ret) = parse_descriptor(desc).ok()?;
     if ptys.first() != Some(&Ty::Ref) {
         return None; // only the (Object, long, …) family
     }
     // Width of the accessed value: return type for plain get*, else last param.
-    let is_long = if name.starts_with("get") && !name.starts_with("getAnd") {
-        ret == Ty::I64
+    let val_ty = if name.starts_with("get") && !name.starts_with("getAnd") {
+        ret
     } else {
-        ptys.last().copied() == Some(Ty::I64)
+        ptys.last().copied().unwrap_or(Ty::Void)
     };
+    let w = match val_ty {
+        Ty::I64 => "long",
+        Ty::Ref => "ref",
+        Ty::I32 => "int",
+        _ => return None,
+    };
+    let vref = val_ty == Ty::Ref;
+    // getAndAdd is arithmetic → int/long only (no ref form).
     let (op, rty) = if name.starts_with("compareAndExchange") {
-        ("caex", if is_long { Ty::I64 } else { Ty::I32 })
+        ("caex", val_ty)
     } else if name.starts_with("compareAndSet") || name.starts_with("weakCompareAndSet") {
         ("cas", Ty::I32)
-    } else if name.starts_with("getAndAdd") {
-        ("getadd", if is_long { Ty::I64 } else { Ty::I32 })
+    } else if name.starts_with("getAndAdd") && !vref {
+        ("getadd", val_ty)
     } else if name.starts_with("getAndSet") {
-        ("getset", if is_long { Ty::I64 } else { Ty::I32 })
+        ("getset", val_ty)
     } else if name.starts_with("put") {
         ("put", Ty::Void)
     } else if name.starts_with("get") {
-        ("get", if is_long { Ty::I64 } else { Ty::I32 })
+        ("get", val_ty)
     } else {
         return None;
     };
-    let func = match (op, is_long) {
-        ("get", false) => "jrt_unsafe_get_int",
-        ("put", false) => "jrt_unsafe_put_int",
-        ("cas", false) => "jrt_unsafe_cas_int",
-        ("caex", false) => "jrt_unsafe_caex_int",
-        ("getset", false) => "jrt_unsafe_getset_int",
-        ("getadd", false) => "jrt_unsafe_getadd_int",
-        ("get", true) => "jrt_unsafe_get_long",
-        ("put", true) => "jrt_unsafe_put_long",
-        ("cas", true) => "jrt_unsafe_cas_long",
-        ("caex", true) => "jrt_unsafe_caex_long",
-        ("getset", true) => "jrt_unsafe_getset_long",
-        ("getadd", true) => "jrt_unsafe_getadd_long",
+    let func = match (op, w) {
+        ("get", "int") => "jrt_unsafe_get_int",
+        ("put", "int") => "jrt_unsafe_put_int",
+        ("cas", "int") => "jrt_unsafe_cas_int",
+        ("caex", "int") => "jrt_unsafe_caex_int",
+        ("getset", "int") => "jrt_unsafe_getset_int",
+        ("getadd", "int") => "jrt_unsafe_getadd_int",
+        ("get", "long") => "jrt_unsafe_get_long",
+        ("put", "long") => "jrt_unsafe_put_long",
+        ("cas", "long") => "jrt_unsafe_cas_long",
+        ("caex", "long") => "jrt_unsafe_caex_long",
+        ("getset", "long") => "jrt_unsafe_getset_long",
+        ("getadd", "long") => "jrt_unsafe_getadd_long",
+        ("get", "ref") => "jrt_unsafe_get_ref",
+        ("put", "ref") => "jrt_unsafe_put_ref",
+        ("cas", "ref") => "jrt_unsafe_cas_ref",
+        ("caex", "ref") => "jrt_unsafe_caex_ref",
+        ("getset", "ref") => "jrt_unsafe_getset_ref",
         _ => return None,
     };
     Some((func, rty))

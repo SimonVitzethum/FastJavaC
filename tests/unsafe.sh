@@ -18,4 +18,16 @@ got="$(echo "$out" | grep -E '^[0-9]+$' | tr '\n' ' ')"
 [ "$got" = "5 5 15 1 20 0 20 7 " ] || { echo "FAIL unsafe (got '$got', want '5 5 15 1 20 0 20 7'): $out"; exit 1; }
 if echo "$out" | grep -q '\[heap\]' && ! echo "$out" | grep -q '0 still live'; then
     echo "FAIL unsafe (heap leak): $(echo "$out" | grep '\[heap\]')"; exit 1; fi
+
+# Reference family (RC store barrier): get/put/compareAndSet/getAndSetReference.
+if ! javac --add-exports java.base/jdk.internal.misc=ALL-UNNAMED -d "$work" "$ex/UnsafeRef.java" 2>"$work/j2"; then
+    echo "ok   unsafe (int ok; ref skipped: javac export)"; exit 0; fi
+if ! "$fastjavac" --dynamic -o "$work/ur" "$work"/UnsafeRef*.class 2>"$work/h2"; then
+    echo "FAIL unsafe-ref (build): $(cat "$work/h2")"; exit 1; fi
+rout="$(cd "$work" && FASTLLVM_HEAPSTATS=1 ./ur 2>&1)"; rcode=$?
+[ "$rcode" = 0 ] || { echo "FAIL unsafe-ref (exit $rcode): $rout"; exit 1; }
+rgot="$(echo "$rout" | grep -E '^[0-9]+$' | tr '\n' ' ')"
+[ "$rgot" = "11 1 22 0 22 11 " ] || { echo "FAIL unsafe-ref (got '$rgot', want '11 1 22 0 22 11'): $rout"; exit 1; }
+if echo "$rout" | grep -q '\[heap\]' && ! echo "$rout" | grep -q '0 still live'; then
+    echo "FAIL unsafe-ref (heap leak): $(echo "$rout" | grep '\[heap\]')"; exit 1; fi
 echo "ok   unsafe"

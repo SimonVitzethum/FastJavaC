@@ -4686,3 +4686,50 @@ int64_t jrt_unsafe_getset_long(void *obj, int64_t off, int64_t v) {
 int64_t jrt_unsafe_getadd_long(void *obj, int64_t off, int64_t delta) {
     return __atomic_fetch_add((int64_t *)((char *)obj + off), delta, __ATOMIC_SEQ_CST);
 }
+
+/* Reference-typed Unsafe accessors carry fastjavac's RC store barrier (retain
+ * new / release old) around the atomic pointer op so the refcount stays balanced
+ * under the 0-live-heap oracle. A getReference returns an OWNED (+1) reference —
+ * matching how a ref read into a local is retained — released by the caller's
+ * cleanup. NOTE: load-then-retain (get/caex-failure) has the classic naive
+ * atomic-RC race under FASTLLVM_THREADS (a concurrent release could free between
+ * load and retain); acceptable within fastjavac's documented RC-under-threads
+ * limits (no concurrent collector). The exchange/CAS paths hand back the old
+ * value exclusively, so transferring its refcount is race-free. */
+void *jrt_unsafe_get_ref(void *obj, int64_t off) {
+    void *v = __atomic_load_n((void **)((char *)obj + off), __ATOMIC_SEQ_CST);
+    jrt_retain(v); /* caller owns the returned reference */
+    return v;
+}
+void jrt_unsafe_put_ref(void *obj, int64_t off, void *x) {
+    jrt_retain(x); /* field takes an owning +1 */
+    void *old = __atomic_exchange_n((void **)((char *)obj + off), x, __ATOMIC_SEQ_CST);
+    jrt_release(old); /* field dropped the previous value */
+}
+void *jrt_unsafe_getset_ref(void *obj, int64_t off, void *x) {
+    jrt_retain(x);
+    void *old = __atomic_exchange_n((void **)((char *)obj + off), x, __ATOMIC_SEQ_CST);
+    return old; /* transfer the field's +1 on `old` to the caller (owned) */
+}
+int32_t jrt_unsafe_cas_ref(void *obj, int64_t off, void *expect, void *x) {
+    jrt_retain(x); /* speculative +1 for the field */
+    void *w = expect;
+    if (__atomic_compare_exchange_n((void **)((char *)obj + off), &w, x, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        jrt_release(expect); /* field dropped the old value (== expect) */
+        return 1;
+    }
+    jrt_release(x); /* CAS failed → undo the speculative retain */
+    return 0;
+}
+void *jrt_unsafe_caex_ref(void *obj, int64_t off, void *expect, void *x) {
+    jrt_retain(x);
+    void *w = expect;
+    if (__atomic_compare_exchange_n((void **)((char *)obj + off), &w, x, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        return w; /* success: w==expect; transfer the field's old +1 to caller */
+    }
+    jrt_release(x);  /* failure: undo x's speculative retain */
+    jrt_retain(w);   /* give the caller its own +1 on the current value */
+    return w;
+}

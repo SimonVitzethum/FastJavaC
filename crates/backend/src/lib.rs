@@ -257,6 +257,11 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_unsafe_caex_long", "i64 (ptr, i64, i64, i64)"),
     ("jrt_unsafe_getset_long", "i64 (ptr, i64, i64)"),
     ("jrt_unsafe_getadd_long", "i64 (ptr, i64, i64)"),
+    ("jrt_unsafe_get_ref", "ptr (ptr, i64)"),
+    ("jrt_unsafe_put_ref", "void (ptr, i64, ptr)"),
+    ("jrt_unsafe_getset_ref", "ptr (ptr, i64, ptr)"),
+    ("jrt_unsafe_cas_ref", "i32 (ptr, i64, ptr, ptr)"),
+    ("jrt_unsafe_caex_ref", "ptr (ptr, i64, ptr, ptr)"),
 ];
 
 fn array_vtable(kind: ArrKind) -> &'static str {
