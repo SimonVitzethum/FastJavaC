@@ -193,10 +193,26 @@ built to the reachable set, not the whole JDK.
    a callee frame-setup convention + two-pass class registration), **object creation**
    (`new` + `<init>`, RC-correct for the factory create-and-return pattern), and **float**
    (32-bit xmm). JIT-defined classes call each other and dispatch by name. Tests:
-   `tests/jit{class,field,new}.sh`. **Remaining:** invokevirtual/invokeinterface (vtable
-   dispatch), JIT-side RC bookkeeping so general local `new` doesn't leak, array creation
-   (newarray/anewarray), call-site alignment for AOT SSE targets, and full exception
-   semantics (uncaught propagation, per-pc stack-depth reset, type-narrowed catches).
+   `tests/jit{class,field,new,virtual}.sh`. **invokevirtual/invokeinterface are now in**
+   (`tests/jitvirtual.sh`): a JIT-defined method dispatches through the receiver's runtime
+   vtable, and open-world builds keep all virtual methods as roots so their vtable slots
+   aren't pruned to null.
+   **Two concrete blockers remain for full JIT-defined *polymorphic classes* (the mod/Mixin
+   pattern — a JIT-defined class extending an AOT/game class, overriding methods that the
+   game then calls virtually). Both were prototyped this session and reverted pending fixes:**
+   1. **JIT-side reference counting.** JITted code emits no retain/release, so any object a
+      JITted method `new`s and keeps in a local leaks (breaks the 0-live-heap oracle). Needs
+      a lightweight RC pass: track reference-typed locals (via astore) and release them at
+      each return (retain the areturn value; never release borrowed params).
+   2. **JIT↔AOT calling-convention unification.** JITted methods use a locals-array-in-RDI
+      ABI; AOT methods use native args-in-registers. A JIT→AOT call, or an AOT vtable slot
+      overridden by a JIT method and called by AOT code, mismatches unless the AOT side
+      ignores `this`/args. Needs a shared ABI (JIT emits native-arg prologues) or boundary
+      thunks. (The prototype worked because its constructors touched no fields.)
+   Also remaining: array creation/access (newarray/anewarray/*aload/*astore), call-site
+   alignment for AOT SSE targets, and full exception semantics (uncaught propagation,
+   per-pc stack-depth reset, type-narrowed catches). Blockers (1) and (2) are the critical
+   path to running actual mod-style code.
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
