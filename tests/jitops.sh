@@ -14,5 +14,5 @@ if ! "$fastjavac" --dynamic -o "$work/host" "$work/JitOpsHost.class" 2>"$work/h"
 out="$(cd "$work" && ./host 2>&1)"; code=$?
 [ "$code" = 0 ] || { echo "FAIL jitops (exit $code): $out"; exit 1; }
 got="$(echo "$out" | tr '\n' ' ')"
-[ "$got" = "5 35 " ] || { echo "FAIL jitops (got '$got', want '5 35' — opcode bug): $out"; exit 1; }
+[ "$got" = "5 35 -1589934580 " ] || { echo "FAIL jitops (got '$got', want '5 35 -1589934580' — opcode bug): $out"; exit 1; }
 echo "ok   jitops"
