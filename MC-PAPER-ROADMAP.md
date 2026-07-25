@@ -185,10 +185,15 @@ built to the reachable set, not the whole JDK.
    longs**; **object arguments** flow into JITted methods; and a **JIT ClassLoader**
    (`jrt_define_class_jit`) registers JITted methods into the FjcClass registry so they
    **dispatch by name** like any AOT/module class (`jrt_call_static`, `tests/jitclass.sh`).
-   Remaining for full JVM coverage: float/double (xmm), exceptions (athrow + exception
-   tables), field access + method calls (getfield/putfield/invoke*, needing constant-pool
-   resolution against the registry), and object RETURNS crossing back into host RC (a
-   retain barrier on areturn).
+   The stencil set now also covers **double arithmetic** (xmm: dadd/dsub/dmul/ddiv,
+   i2d/d2i, dreturn), **exceptions** (athrow → handler dispatch via the exception table,
+   checkcast no-op), **object returns** with an RC retain barrier, and **field access**
+   (getfield/putfield with offsets resolved from the FjcClass registry via the constant
+   pool). Tests: `tests/jit{class,field}.sh`. **Remaining:** method calls
+   (invoke*, needing a callee frame-setup convention), `new`/array creation, float (32-bit,
+   parallel to double), and full exception semantics (uncaught propagation, per-pc
+   stack-depth reset for deep throws, type-narrowed catches). With `new` + invoke*, a
+   JIT-defined class becomes fully self-contained — the last big step for this milestone.
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
