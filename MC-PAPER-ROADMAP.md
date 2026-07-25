@@ -257,6 +257,23 @@ target. The MC *client* (10) is a separate, much larger native-graphics project.
   validate or kill the two central theses (compile-OpenJDK, cheap-JIT) before committing
   to the GC/JNI/`invoke` build-out.
 
+## 9a. Milestone-2 spike DONE — result (see JDK-SPIKE.md)
+
+**Executed 2026-07-25.** Key results, which reprioritise the ladder:
+- You **cannot** compile a small JDK slice: the closed-world closure of any real class
+  explodes (`Objects` → `AssertionError` → `Comparator` → `function.*` lambdas → …). The
+  JDK must be compiled as **one whole closed world**.
+- With the whole `java.base` (7,357 classes) as the closed world, the first wall is a
+  **real feature** (`Class.getCanonicalName` — reflection generality), not a missing class.
+  So the residual backlog is finite/enumerable: reflection generality, **full indy**,
+  the native layer, core-model completeness (full exception hierarchy + String/StringBuilder),
+  parser robustness on huge constants.
+- **Native-method backlog measured:** java.lang 116, java.io 48, nio.ch 133,
+  jdk.internal.misc 90, java.nio 5 — but **java.util = 2 native / 485 classes** (≈pure).
+- **Consequence:** milestone 2 is *gated* on **full invokedynamic/MethodHandles**
+  (every `java.util.function` lambda needs it, and it's buildable without the native layer).
+  → **invokedynamic is the correct next unlock, not the native layer.**
+
 ## 10. Recommended first concrete steps (two parallel spikes)
 
 1. **OpenJDK-compile spike (milestone 2):** pick ~a few hundred `java.base` classes
