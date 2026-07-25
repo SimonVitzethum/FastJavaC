@@ -3928,6 +3928,20 @@ static void jni_bridge_set_region(void *env, void *arr, int32_t start, int32_t l
     (void)env; if (arr && buf && len > 0) memcpy((char *)arr + 32 + start, buf, (size_t)len);
 }
 static void jni_bridge_noop(void) {}         /* ExceptionClear/ReleaseByteArrayElements */
+
+/* JNI local references: an object a native creates or retrieves is valid until the
+ * native returns (JNI local-ref semantics). We register each in a per-thread frame;
+ * jni_invoke_core opens a frame around the native call and, on return, releases the
+ * frame's refs EXCEPT the returned object (whose +1 becomes the Java caller's). This
+ * gives correct cross-boundary RC — no leaks, no over-release. Registering only
+ * adds to the frame; the +1 is either already held (created objects) or taken by the
+ * caller before registering (retrieved objects). */
+static _Thread_local void *jni_lref[512];
+static _Thread_local int jni_lref_top;
+static void *jni_local(void *o) {
+    if (o && jni_lref_top < 512) jni_lref[jni_lref_top++] = o;
+    return o;
+}
 /* String access: our JStr is UTF-8 {refcount, vtable, len, bytes…} but not
  * NUL-terminated, so GetStringUTFChars hands back a NUL-terminated copy (freed by
  * Release). NewStringUTF makes a runtime JStr. (ASCII/UTF-8 identity; a full
@@ -3954,7 +3968,7 @@ static void *jni_bridge_newstringutf(void *env, const char *c) {
     size_t n = jrt_strlen(c);
     JStr *s = str_alloc((int64_t)n);
     memcpy(s->bytes, c, n);
-    return s;
+    return jni_local(s);
 }
 
 /* --- General field access via the FjcClass registry --- so ANY JNI native that
@@ -4014,15 +4028,21 @@ static int32_t jni_bridge_getshortfield(void *e, void *o, void *f){ (void)e; ret
 static void    jni_bridge_setshortfield(void *e, void *o, void *f, int32_t v){(void)e; *(int32_t *)FLD(o, f) = (int16_t)v; }
 static int32_t jni_bridge_getcharfield(void *e, void *o, void *f) { (void)e; return (uint16_t)*(int32_t *)FLD(o, f); }
 static void    jni_bridge_setcharfield(void *e, void *o, void *f, int32_t v){ (void)e; *(int32_t *)FLD(o, f) = (uint16_t)v; }
-static void   *jni_bridge_getobjectfield(void *e, void *o, void *f){(void)e; void *v = *(void **)FLD(o, f); jrt_retain(v); return v; }
+static void   *jni_bridge_getobjectfield(void *e, void *o, void *f){(void)e; void *v = *(void **)FLD(o, f); jrt_retain(v); return jni_local(v); }
 static void    jni_bridge_setobjectfield(void *e, void *o, void *f, void *v){ (void)e; void **p = (void **)FLD(o, f); jrt_retain(v); void *old = *p; *p = v; jrt_release(old); }
 #undef FLD
 static int32_t jni_bridge_getversion(void *e) { (void)e; return 0x00010008; }   /* JNI 1.8 */
 
 /* Reference management — maps onto fastjavac's RC: a global/local ref is a retained
  * pointer; deleting releases it. Weak refs don't retain (best-effort). */
-static void *jni_bridge_newref(void *e, void *o) { (void)e; jrt_retain(o); return o; }
-static void  jni_bridge_delref(void *e, void *o) { (void)e; jrt_release(o); }
+static void *jni_bridge_newref(void *e, void *o) { (void)e; jrt_retain(o); return o; }   /* global: not frame-managed */
+static void  jni_bridge_delref(void *e, void *o) { (void)e; jrt_release(o); }             /* DeleteGlobalRef */
+static void *jni_bridge_newlocalref(void *e, void *o) { (void)e; jrt_retain(o); return jni_local(o); }
+static void  jni_bridge_dellocalref(void *e, void *o) {
+    (void)e;
+    for (int i = jni_lref_top - 1; i >= 0; i--) if (jni_lref[i] == o) { jni_lref[i] = NULL; break; }
+    jrt_release(o);
+}
 static void *jni_bridge_newweakref(void *e, void *o) { (void)e; return o; }
 static void  jni_bridge_noref(void *e, void *o) { (void)e; (void)o; }
 static int32_t jni_bridge_issame(void *e, void *a, void *b) { (void)e; return a == b ? 1 : 0; }
@@ -4107,7 +4127,7 @@ static int64_t jni_call_va(void *recv, const FjcMethod *m, va_list ap, char ret)
 #define RI  return (int32_t)r;
 #define RJ  return r;
 #define RB  return (int8_t)r;
-#define RP  return (void *)(intptr_t)r;
+#define RP  return jni_local((void *)(intptr_t)r);   /* returned object → current local frame */
 #define RV  (void)r; return;
 #define RD  { double d; memcpy(&d, &r, 8); return d; }
 #define RF  { int32_t x = (int32_t)r; float f; memcpy(&f, &x, 4); return f; }
@@ -4210,9 +4230,9 @@ static void jni_env_setup(void) {
     jni_table[20]  = (void *)jni_bridge_poplocalframe;
     jni_table[21]  = (void *)jni_bridge_newref;          /* NewGlobalRef */
     jni_table[22]  = (void *)jni_bridge_delref;          /* DeleteGlobalRef */
-    jni_table[23]  = (void *)jni_bridge_delref;          /* DeleteLocalRef */
+    jni_table[23]  = (void *)jni_bridge_dellocalref;     /* DeleteLocalRef */
     jni_table[24]  = (void *)jni_bridge_issame;
-    jni_table[25]  = (void *)jni_bridge_newref;          /* NewLocalRef */
+    jni_table[25]  = (void *)jni_bridge_newlocalref;     /* NewLocalRef */
     jni_table[26]  = (void *)jni_bridge_localcap;
     jni_table[32]  = (void *)jni_bridge_isinstanceof;
     jni_table[226] = (void *)jni_bridge_newweakref;
@@ -4386,17 +4406,32 @@ static int64_t jni_invoke_core(const void *sym_j, const void *argdesc_j, int32_t
     for (int i = 0; i < n; i++) { atypes[2 + i] = ffi_of(jni_argsig[i]); avals[2 + i] = &jni_argbuf[i]; }
     ffi_cif cif;
     if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)(2 + n), ffi_of((char)ret), atypes) != FFI_OK) return 0;
+    int frame = jni_lref_top;                              /* open a local-ref frame */
     union { ffi_arg a; int64_t i64; float f; double d; } r; r.i64 = 0;
     ffi_call(&cif, FFI_FN(fn), &r, avals);
+    int64_t out;
     switch ((char)ret) {
-        case 'V': return 0;
-        case 'F': { int32_t b; memcpy(&b, &r.f, 4); return (int64_t)b; }
-        case 'D': { int64_t b; memcpy(&b, &r.d, 8); return b; }
-        case 'Z': case 'B': return (int8_t)(int64_t)r.a;
-        case 'C': case 'S': return (int16_t)(int64_t)r.a;
-        case 'I': return (int32_t)(int64_t)r.a;
-        default:  return (int64_t)r.a;
+        case 'V': out = 0; break;
+        case 'F': { int32_t b; memcpy(&b, &r.f, 4); out = (int64_t)b; break; }
+        case 'D': { int64_t b; memcpy(&b, &r.d, 8); out = b; break; }
+        case 'Z': case 'B': out = (int8_t)(int64_t)r.a; break;
+        case 'C': case 'S': out = (int16_t)(int64_t)r.a; break;
+        case 'I': out = (int32_t)(int64_t)r.a; break;
+        default:  out = (int64_t)r.a; break;
     }
+    /* close the frame: release every local the native created EXCEPT exactly one
+     * reference to the returned object (its +1 passes to the Java caller; extra
+     * registrations of the same object are released). */
+    void *keep = (ret == 'L' || ret == '[') ? (void *)(intptr_t)out : NULL;
+    int kept = 0;
+    for (int i = frame; i < jni_lref_top; i++) {
+        void *o = jni_lref[i];
+        if (!o) continue;
+        if (o == keep && !kept) { kept = 1; continue; }
+        jrt_release(o);
+    }
+    jni_lref_top = frame;
+    return out;
 }
 /* Typed entry points — the frontend picks one by the native method's return type,
  * so the Call's result type matches the C signature exactly. */
