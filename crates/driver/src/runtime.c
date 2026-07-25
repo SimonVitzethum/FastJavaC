@@ -2822,8 +2822,13 @@ static void jvm_delta(uint8_t op, const uint8_t *bc, int pc, const CpInfo *cp, i
         case 0x4f: case 0x53: *pops = 3; break;                          /* iastore/aastore */
         case 0x36 ... 0x4e: case 0x57: *pops = 1; break;                 /* stores / pop */
         case 0x60: case 0x61: case 0x63 ... 0x65: case 0x67 ... 0x69: case 0x6b: case 0x6f:
-            *pops = 2; *pushes = 1; break;                               /* binary arith */
-        case 0x74: case 0x85 ... 0x8e: case 0xb4: case 0xc0: *pops = 1; *pushes = 1; break; /* unary/conv/getfield/checkcast */
+        case 0x78 ... 0x83: case 0x94:
+            *pops = 2; *pushes = 1; break;                               /* binary arith / shift / bitwise / lcmp */
+        case 0x74: case 0x75: case 0x85 ... 0x8e: case 0x91 ... 0x93: case 0xb4: case 0xc0:
+            *pops = 1; *pushes = 1; break;                               /* unary / conv / getfield / checkcast */
+        case 0x58: *pops = 2; break;                                     /* pop2 */
+        case 0x5a: *pops = 2; *pushes = 3; break;                        /* dup_x1 */
+        case 0xc2: case 0xc3: *pops = 1; break;                          /* monitorenter/exit */
         case 0xb5: *pops = 2; break;                                     /* putfield */
         case 0x99 ... 0x9e: case 0xc6: case 0xc7: case 0xac ... 0xb0: case 0xbf:
             *pops = 1; break;                                           /* if<0>/returns-value/athrow */
@@ -3016,6 +3021,35 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x84: { int idx = bc[pc + 1]; int32_t c = (int8_t)bc[pc + 2]; je1(0x81); je1(0x43); je1((unsigned char)(8 * idx)); je_i32(c); pc += 3; break; } /* iinc */
             case 0x59: jeN("\xFF\x34\x24", 3); pc++; break;                          /* dup */
             case 0x57: jeN("\x48\x83\xC4\x08", 4); pc++; break;                      /* pop */
+            case 0x00: pc++; break;                                                  /* nop */
+            case 0x58: jeN("\x48\x83\xC4\x10", 4); pc++; break;                      /* pop2: add rsp,16 */
+            case 0x5a: je1(0x58); je1(0x59); je1(0x50); je1(0x51); je1(0x50); pc++; break; /* dup_x1: [v2 v1]->[v1 v2 v1] */
+            case 0x75: jeN("\x48\xF7\x1C\x24", 4); pc++; break;                      /* lneg: neg qword [rsp] */
+            /* int shifts: pop rcx(v2); eax=[rsp](v1); shift eax,cl; [rsp]=eax */
+            case 0x78: je1(0x59); jeN("\x8B\x04\x24", 3); jeN("\xD3\xE0", 2); jeN("\x89\x04\x24", 3); pc++; break; /* ishl */
+            case 0x7a: je1(0x59); jeN("\x8B\x04\x24", 3); jeN("\xD3\xF8", 2); jeN("\x89\x04\x24", 3); pc++; break; /* ishr (sar) */
+            case 0x7c: je1(0x59); jeN("\x8B\x04\x24", 3); jeN("\xD3\xE8", 2); jeN("\x89\x04\x24", 3); pc++; break; /* iushr (shr) */
+            /* long shifts: pop rcx(v2); rax=[rsp](v1); shift rax,cl; [rsp]=rax */
+            case 0x79: je1(0x59); jeN("\x48\x8B\x04\x24", 4); jeN("\x48\xD3\xE0", 3); jeN("\x48\x89\x04\x24", 4); pc++; break; /* lshl */
+            case 0x7b: je1(0x59); jeN("\x48\x8B\x04\x24", 4); jeN("\x48\xD3\xF8", 3); jeN("\x48\x89\x04\x24", 4); pc++; break; /* lshr */
+            case 0x7d: je1(0x59); jeN("\x48\x8B\x04\x24", 4); jeN("\x48\xD3\xE8", 3); jeN("\x48\x89\x04\x24", 4); pc++; break; /* lushr */
+            /* int bitwise: pop rax(v2); OP [rsp],eax */
+            case 0x7e: je1(0x58); jeN("\x21\x04\x24", 3); pc++; break;               /* iand */
+            case 0x80: je1(0x58); jeN("\x09\x04\x24", 3); pc++; break;               /* ior  */
+            case 0x82: je1(0x58); jeN("\x31\x04\x24", 3); pc++; break;               /* ixor */
+            /* long bitwise: pop rax(v2); OP qword [rsp],rax */
+            case 0x7f: je1(0x58); jeN("\x48\x21\x04\x24", 4); pc++; break;           /* land */
+            case 0x81: je1(0x58); jeN("\x48\x09\x04\x24", 4); pc++; break;           /* lor  */
+            case 0x83: je1(0x58); jeN("\x48\x31\x04\x24", 4); pc++; break;           /* lxor */
+            /* int narrowing: sign/zero-extend the low byte/half in place */
+            case 0x91: jeN("\x8B\x04\x24", 3); jeN("\x0F\xBE\xC0", 3); jeN("\x89\x04\x24", 3); pc++; break; /* i2b: movsx eax,al */
+            case 0x92: jeN("\x8B\x04\x24", 3); jeN("\x0F\xB7\xC0", 3); jeN("\x89\x04\x24", 3); pc++; break; /* i2c: movzx eax,ax */
+            case 0x93: jeN("\x8B\x04\x24", 3); jeN("\x0F\xBF\xC0", 3); jeN("\x89\x04\x24", 3); pc++; break; /* i2s: movsx eax,ax */
+            /* lcmp: v1,v2 -> sign(v1-v2) as -1/0/1 (branchless: setg - setl) */
+            case 0x94: je1(0x58); je1(0x59); jeN("\x48\x39\xC1", 3); jeN("\x0F\x9F\xC2", 3);
+                       jeN("\x0F\x9C\xC0", 3); jeN("\x28\xC2", 2); jeN("\x48\x0F\xBE\xC2", 4); je1(0x50); pc++; break;
+            /* monitorenter/exit: single-thread no-op (drop the objectref) */
+            case 0xc2: case 0xc3: jeN("\x48\x83\xC4\x08", 4); pc++; break;
             case 0xa7: je_jmp(pc + je_s16(bc + pc + 1)); pc += 3; break;             /* goto */
             case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e:        /* if<cond> vs 0 */
                 je1(0x58); jeN("\x85\xC0", 2); je_jcc(CC[op - 0x99], pc + je_s16(bc + pc + 1)); pc += 3; break;
