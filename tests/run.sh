@@ -69,6 +69,7 @@ run() {
 # --- Basics ---
 run hello         0 Hello Hello
 run fjcintro      0 FjcIntro FjcIntro Point   # Phase 0: runtime FjcClass introspection
+run convops       0 ConvOps ConvOps Box       # i2b/i2c/i2s narrowing + dup_x1
 run arith         1 Arith Arith            # uncaught ArithmeticException
 run stack         0 Stack Stack Point
 run app           0 App App Lib

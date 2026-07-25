@@ -1577,6 +1577,35 @@ fn lower_block(
                 let src = ml.stack_slot(stack.len() - 1, ty);
                 push!(ty, Rvalue::Use(Operand::Copy(src)));
             }
+            // dup_x1: ..., v2, v1 -> ..., v1, v2, v1  (both category 1). Snapshot both
+            // into fresh temps first so equal types don't clobber (slots are keyed by
+            // (depth, ty), so v1 and v2 alias the same slot when their types match).
+            Instr::DupX1 => {
+                let t1 = *stack.last().ok_or_else(|| FrontendError::Unsupported("dup_x1 on empty stack".into()))?;
+                let v1 = pop!();
+                let t2 = *stack.last().ok_or_else(|| FrontendError::Unsupported("dup_x1 with <2 stack values".into()))?;
+                let v2 = pop!();
+                let f1 = ml.fresh(t1);
+                stmts.push(Statement::Assign(f1, Rvalue::Use(Operand::Copy(v1))));
+                let f2 = ml.fresh(t2);
+                stmts.push(Statement::Assign(f2, Rvalue::Use(Operand::Copy(v2))));
+                push!(t1, Rvalue::Use(Operand::Copy(f1)));
+                push!(t2, Rvalue::Use(Operand::Copy(f2)));
+                push!(t1, Rvalue::Use(Operand::Copy(f1)));
+            }
+            // i2b/i2s: truncate to 8/16 bits then sign-extend back to int
+            // ((x << k) >> k, arithmetic). i2c: zero-extend low 16 bits (x & 0xFFFF).
+            Instr::I2B | Instr::I2S => {
+                let bits = if matches!(instr, Instr::I2B) { 24 } else { 16 };
+                let v = pop!();
+                let t = ml.fresh(Ty::I32);
+                stmts.push(Statement::Assign(t, Rvalue::Binary(BinOp::Shl, Operand::Copy(v), Operand::ConstI32(bits))));
+                push!(Ty::I32, Rvalue::Binary(BinOp::Shr, Operand::Copy(t), Operand::ConstI32(bits)));
+            }
+            Instr::I2C => {
+                let v = pop!();
+                push!(Ty::I32, Rvalue::Binary(BinOp::And, Operand::Copy(v), Operand::ConstI32(0xFFFF)));
+            }
             Instr::Dup2 => {
                 let top = *stack.last().ok_or_else(|| {
                     FrontendError::Unsupported("dup2 on empty stack".into())
