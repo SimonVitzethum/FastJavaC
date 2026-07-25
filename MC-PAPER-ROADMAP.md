@@ -180,10 +180,15 @@ built to the reachable set, not the whole JDK.
    (incl. loops/branches) — no AOT of that method, no subprocess. The **`defineClass(byte[])`
    entry is also done** (`jrt_jit_raw` for a raw method blob, `jrt_define_and_run` for an
    in-memory class file, `tests/jitmem.sh`): bytecode a program generates in memory at
-   runtime is JITted to native code in-process — the bridge to ASM/Mixin. Remaining for
-   this milestone: the full per-bytecode stencil set (objects/field access/calls/longs/
-   floats/exceptions), object arguments/returns, and a real `ClassLoader` registering the
-   JITted methods into the FjcClass registry so they dispatch like any other class.
+   runtime is JITted to native code in-process — the bridge to ASM/Mixin. The stencil set
+   now also covers **references** (aload/astore/areturn, if_acmp, ifnull) and **64-bit
+   longs**; **object arguments** flow into JITted methods; and a **JIT ClassLoader**
+   (`jrt_define_class_jit`) registers JITted methods into the FjcClass registry so they
+   **dispatch by name** like any AOT/module class (`jrt_call_static`, `tests/jitclass.sh`).
+   Remaining for full JVM coverage: float/double (xmm), exceptions (athrow + exception
+   tables), field access + method calls (getfield/putfield/invoke*, needing constant-pool
+   resolution against the registry), and object RETURNS crossing back into host RC (a
+   retain barrier on areturn).
 5. **`Unsafe` + tracing GC for the dynamic heap** (§5) → `Unsafe`/reflection-heavy program
    balances and survives GC.
 6. **JNI + NIO/Netty native** (§6) → a trivial Netty echo server runs.
