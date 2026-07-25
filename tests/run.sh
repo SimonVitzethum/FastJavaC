@@ -236,6 +236,7 @@ if sh "$root/tests/p5.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jit.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitmem.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitclass.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/jitfield.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 
 echo "---"
 echo "$pass passed, $fail failed"

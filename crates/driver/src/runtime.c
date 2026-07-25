@@ -2706,9 +2706,50 @@ static void je_jcc(unsigned char cc, int tpc) { je1(0x0F); je1(cc); JIT_FIX[JIT_
 static void je_jmp(int tpc) { je1(0xE9); JIT_FIX[JIT_NFIX].off = JIT_LEN; JIT_FIX[JIT_NFIX].target_pc = tpc; JIT_NFIX++; je_i32(0); }
 static int16_t je_s16(const uint8_t *b) { return (int16_t)((b[0] << 8) | b[1]); }
 
+static int cf_utf8eq(const uint8_t *s, int len, const char *c); /* fwd */
+
+/* Constant-pool view for resolving getfield/putfield (and later invoke*) against the
+ * FjcClass registry. Built by cf_define_class from the defining class's constant pool. */
+typedef struct {
+    const uint8_t **u; const int *ul; int cpc;
+    const uint16_t *cls_ni;    /* Class -> name_index (Utf8) */
+    const uint16_t *ref_class; /* Fieldref/Methodref -> class_index */
+    const uint16_t *ref_nat;   /* Fieldref/Methodref -> NameAndType index */
+    const uint16_t *nat_name;  /* NameAndType -> name_index */
+    const uint16_t *nat_desc;  /* NameAndType -> descriptor_index */
+} CpInfo;
+
+/* Resolve a Fieldref cp index to its byte offset in the object + whether it is 8 bytes
+ * wide (long/double/reference) vs 4 (int-family). Looks the declaring class up in the
+ * FjcClass registry (which carries field offsets from AOT compilation). Returns 1 on
+ * success. */
+static int jit_resolve_field(const CpInfo *cp, int fref, int *out_off, int *out_wide) {
+    if (!cp || fref <= 0 || fref >= cp->cpc) return 0;
+    int ci = cp->ref_class[fref], ni = cp->ref_nat[fref];
+    if (ci <= 0 || ci >= cp->cpc || ni <= 0 || ni >= cp->cpc) return 0;
+    int cni = cp->cls_ni[ci], fni = cp->nat_name[ni], fdi = cp->nat_desc[ni];
+    if (cni <= 0 || cni >= cp->cpc || fni <= 0 || fni >= cp->cpc) return 0;
+    char dotted[256];
+    int cl = cp->ul[cni]; if (cl >= (int)sizeof dotted) return 0;
+    for (int i = 0; i < cl; i++) { char ch = (char)cp->u[cni][i]; dotted[i] = ch == '/' ? '.' : ch; }
+    dotted[cl] = '\0';
+    const FjcClass *c = jrt_class_by_name(dotted);
+    if (!c) return 0;
+    for (uint32_t k = 0; k < c->n_fields; k++) {
+        if (cf_utf8eq(cp->u[fni], cp->ul[fni], c->fields[k].name)) {
+            *out_off = (int)c->fields[k].offset;
+            const char *d = c->fields[k].desc;
+            *out_wide = (d && (d[0] == 'J' || d[0] == 'D' || d[0] == 'L' || d[0] == '[')) ? 1 : 0;
+            (void)fdi;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* `exc` points at the method's exception_table entries (8 bytes each: start/end/handler/
  * catch_type, big-endian), `nexc` the count; NULL/0 if none. Used to dispatch athrow. */
-static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc) {
+static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc, const CpInfo *cp) {
     if (n <= 0 || n >= (1 << 16)) return NULL;
     JIT_LEN = 0; JIT_NFIX = 0;
     for (int i = 0; i <= n; i++) JIT_NOFF[i] = -1;
@@ -2739,6 +2780,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:        /* if_icmp<cond> */
                 je1(0x58); je1(0x59); jeN("\x39\xC1", 2); je_jcc(CC[op - 0x9f], pc + je_s16(bc + pc + 1)); pc += 3; break;
             case 0xac: je1(0x58); je1(0xC3); pc++; break;                            /* ireturn */
+            case 0xb1: je1(0xC3); pc++; break;                                       /* return (void) */
             /* --- references (opaque 64-bit pointers; fit the same 64-bit slots) --- */
             case 0x01: je_push_imm(0); pc++; break;                                  /* aconst_null */
             case 0x19: je_push_local(bc[pc + 1]); pc += 2; break;                    /* aload */
@@ -2797,6 +2839,23 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 je_jmp(handler); pc++; break;
             }
             case 0xc0: pc += 3; break; /* checkcast: trusted no-op (leaves the ref) */
+            /* --- field access (offset resolved against the FjcClass registry) --- */
+            case 0xb4: { /* getfield: pop objref; load field; push */
+                int off, wide;
+                if (!jit_resolve_field(cp, (bc[pc + 1] << 8) | bc[pc + 2], &off, &wide)) return NULL;
+                je1(0x58); /* pop rax (objref) */
+                if (wide) { jeN("\x48\x8B\x80", 3); je_i32(off); } /* mov rax, [rax+off] */
+                else { jeN("\x8B\x80", 2); je_i32(off); }         /* mov eax, [rax+off] (zero-ext) */
+                je1(0x50); pc += 3; break; /* push rax */
+            }
+            case 0xb5: { /* putfield: pop value; pop objref; store */
+                int off, wide;
+                if (!jit_resolve_field(cp, (bc[pc + 1] << 8) | bc[pc + 2], &off, &wide)) return NULL;
+                je1(0x58); je1(0x59); /* pop rax (value); pop rcx (objref) */
+                if (wide) { jeN("\x48\x89\x81", 3); je_i32(off); } /* mov [rcx+off], rax */
+                else { jeN("\x89\x81", 2); je_i32(off); }         /* mov [rcx+off], eax */
+                pc += 3; break;
+            }
             default: return NULL; /* unsupported opcode */
         }
         if (JIT_LEN > (int)sizeof(JIT_CODE) - 32) return NULL;
@@ -2888,7 +2947,7 @@ int32_t jrt_jit_run(const void *path_j, const void *mname_j, const void *mdesc_j
     const uint8_t *jexc = NULL; int njexc = 0;
     const uint8_t *code = cf_find_code(buf, flen, mname, mdesc, &codelen, &jexc, &njexc);
     if (!code || codelen <= 0) { free(buf); return -6; }
-    jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc);
+    jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc, NULL);
     free(buf); /* bytecode already copied into the JITted page */
     if (!fn) return -7;
 
@@ -2937,7 +2996,7 @@ int32_t jrt_jit_raw(const void *bc_arr, int32_t arg) {
     if (!bc_arr) return -1;
     int64_t len = JARR_LEN(bc_arr);
     if (len <= 0 || len > (1 << 16)) return -2;
-    jit_fn fn = jit_compile_bc(JARR_DATA(bc_arr), (int)len, NULL, 0);
+    jit_fn fn = jit_compile_bc(JARR_DATA(bc_arr), (int)len, NULL, 0, NULL);
     if (!fn) return -3;
     int64_t locals[64] = {0};
     locals[0] = arg;
@@ -2960,7 +3019,7 @@ int32_t jrt_define_and_run(const void *class_arr, const void *m_j, const void *d
     const uint8_t *jexc = NULL; int njexc = 0;
     const uint8_t *code = cf_find_code(JARR_DATA(class_arr), len, mname, mdesc, &codelen, &jexc, &njexc);
     if (!code || codelen <= 0) return -6;
-    jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc);
+    jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc, NULL);
     if (!fn) return -7;
     int64_t locals[64] = {0};
     locals[0] = arg;
@@ -2984,8 +3043,13 @@ static int cf_define_class(const uint8_t *f, long flen) {
     uint16_t cpc = cf_be16(f + 8);
     const uint8_t **u = (const uint8_t **)calloc(cpc, sizeof(void *));
     int *ul = (int *)calloc(cpc, sizeof(int));
-    uint16_t *cls_ni = (uint16_t *)calloc(cpc, sizeof(uint16_t)); /* Class entry -> name_index */
-    if (!u || !ul || !cls_ni) { free(u); free(ul); free(cls_ni); return -2; }
+    uint16_t *cls_ni = (uint16_t *)calloc(cpc, sizeof(uint16_t)); /* Class -> name_index */
+    uint16_t *ref_class = (uint16_t *)calloc(cpc, sizeof(uint16_t)); /* Fieldref/Methodref -> class_index */
+    uint16_t *ref_nat = (uint16_t *)calloc(cpc, sizeof(uint16_t));   /* -> NameAndType index */
+    uint16_t *nat_name = (uint16_t *)calloc(cpc, sizeof(uint16_t));  /* NameAndType -> name_index */
+    uint16_t *nat_desc = (uint16_t *)calloc(cpc, sizeof(uint16_t));  /* -> descriptor_index */
+#define CF_FREE_CP() do { free(u); free(ul); free(cls_ni); free(ref_class); free(ref_nat); free(nat_name); free(nat_desc); } while (0)
+    if (!u || !ul || !cls_ni || !ref_class || !ref_nat || !nat_name || !nat_desc) { CF_FREE_CP(); return -2; }
     const uint8_t *p = f + 10;
     for (int i = 1; i < cpc; i++) {
         uint8_t tag = *p++;
@@ -2994,11 +3058,14 @@ static int cf_define_class(const uint8_t *f, long flen) {
             case 7: cls_ni[i] = cf_be16(p); p += 2; break;
             case 8: case 16: case 19: case 20: p += 2; break;
             case 15: p += 3; break;
-            case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18: p += 4; break;
+            case 9: case 10: case 11: ref_class[i] = cf_be16(p); ref_nat[i] = cf_be16(p + 2); p += 4; break;
+            case 12: nat_name[i] = cf_be16(p); nat_desc[i] = cf_be16(p + 2); p += 4; break;
+            case 3: case 4: case 17: case 18: p += 4; break;
             case 5: case 6: p += 8; i++; break;
-            default: free(u); free(ul); free(cls_ni); return -3;
+            default: CF_FREE_CP(); return -3;
         }
     }
+    CpInfo cpinfo = { u, ul, cpc, cls_ni, ref_class, ref_nat, nat_name, nat_desc };
     uint16_t this_class = cf_be16(p + 2);          /* after access(2) */
     p += 6;                                        /* access, this, super */
     p += 2 + 2 * cf_be16(p);                       /* interfaces */
@@ -3007,7 +3074,7 @@ static int cf_define_class(const uint8_t *f, long flen) {
     uint16_t mc = cf_be16(p); p += 2;              /* methods */
 
     FjcMethod *methods = (FjcMethod *)calloc(mc ? mc : 1, sizeof(FjcMethod));
-    if (!methods) { free(u); free(ul); free(cls_ni); return -4; }
+    if (!methods) { CF_FREE_CP(); return -4; }
     int nm = 0, jitted = 0;
     for (int i = 0; i < mc; i++) {
         uint16_t maf = cf_be16(p); p += 2;
@@ -3026,7 +3093,7 @@ static int cf_define_class(const uint8_t *f, long flen) {
         }
         if (ni >= cpc || di >= cpc) continue;
         void *codeptr = NULL;
-        if (code && codelen > 0) { jit_fn fn = jit_compile_bc(code, codelen, mexc, nmexc); if (fn) { codeptr = (void *)fn; jitted++; } }
+        if (code && codelen > 0) { jit_fn fn = jit_compile_bc(code, codelen, mexc, nmexc, &cpinfo); if (fn) { codeptr = (void *)fn; jitted++; } }
         methods[nm].name = util8dup(u[ni], ul[ni]);
         methods[nm].desc = util8dup(u[di], ul[di]);
         methods[nm].code = codeptr;
@@ -3043,7 +3110,7 @@ static int cf_define_class(const uint8_t *f, long flen) {
     }
     FjcClass *c = (FjcClass *)calloc(1, sizeof(FjcClass));
     const FjcClass **arr = (const FjcClass **)calloc(1, sizeof(void *));
-    free(u); free(ul); free(cls_ni);
+    CF_FREE_CP();
     if (!c || !arr || !name) { free(c); free(arr); free(name); free(methods); return -5; }
     c->abi_version = FJC_ABI_VERSION;
     c->name = name;
