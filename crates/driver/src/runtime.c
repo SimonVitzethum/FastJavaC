@@ -3926,6 +3926,34 @@ static void jni_bridge_set_region(void *env, void *arr, int32_t start, int32_t l
     (void)env; if (arr && buf && len > 0) memcpy((char *)arr + 32 + start, buf, (size_t)len);
 }
 static void jni_bridge_noop(void) {}         /* ExceptionClear/ReleaseByteArrayElements */
+/* String access: our JStr is UTF-8 {refcount, vtable, len, bytes…} but not
+ * NUL-terminated, so GetStringUTFChars hands back a NUL-terminated copy (freed by
+ * Release). NewStringUTF makes a runtime JStr. (ASCII/UTF-8 identity; a full
+ * UTF-16↔UTF-8 conversion is a future refinement.) */
+static const char *jni_bridge_getstringutf(void *env, void *jstr, void *isCopy) {
+    (void)env;
+    if (isCopy) *(int8_t *)isCopy = 1;
+    if (!jstr) return NULL;
+    JStr *s = (JStr *)jstr;
+    char *c = (char *)plat_alloc((size_t)s->len + 1);
+    if (!c) return NULL;
+    memcpy(c, s->bytes, (size_t)s->len); c[s->len] = '\0';
+    return c;
+}
+static void jni_bridge_releasestringutf(void *env, void *jstr, const char *chars) {
+    (void)env; (void)jstr; if (chars) plat_free((void *)chars);
+}
+static int32_t jni_bridge_getstringutflen(void *env, void *jstr) {
+    (void)env; return jstr ? (int32_t)((JStr *)jstr)->len : 0;
+}
+static void *jni_bridge_newstringutf(void *env, const char *c) {
+    (void)env;
+    if (!c) return NULL;
+    size_t n = jrt_strlen(c);
+    JStr *s = str_alloc((int64_t)n);
+    memcpy(s->bytes, c, n);
+    return s;
+}
 
 static void *jni_table[236];                 /* JNINativeInterface_ slot count */
 static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
@@ -3979,6 +4007,11 @@ static void jni_env_setup(void) {
     jni_table[200] = (void *)jni_bridge_get_region;
     jni_table[208] = (void *)jni_bridge_set_region;
     jni_table[17]  = (void *)jni_bridge_noop;            /* ExceptionClear */
+    jni_table[164] = (void *)jni_bridge_getstringutflen; /* GetStringLength (≈UTF-8 len) */
+    jni_table[167] = (void *)jni_bridge_newstringutf;
+    jni_table[168] = (void *)jni_bridge_getstringutflen;
+    jni_table[169] = (void *)jni_bridge_getstringutf;
+    jni_table[170] = (void *)jni_bridge_releasestringutf;
     jni_table[222] = (void *)jni_bridge_get_critical;
     jni_table[223] = (void *)jni_bridge_release_critical;
     jni_table_ptr = jni_table;
@@ -5106,6 +5139,11 @@ int32_t jrt_f2i(float f) {
     if (f <= -2147483648.0f) return INT32_MIN;
     return (int32_t)f;
 }
+/* IEEE-754 bit reinterpretation (Double/Float.*Bits — common in FFI/serialization). */
+int64_t jrt_d2rawbits(double d) { int64_t b; jrt_memcpy(&b, &d, 8); return b; }
+double  jrt_rawbits2d(int64_t b) { double d; jrt_memcpy(&d, &b, 8); return d; }
+int32_t jrt_f2rawbits(float f) { int32_t b; jrt_memcpy(&b, &f, 4); return b; }
+float   jrt_rawbits2f(int32_t b) { float f; jrt_memcpy(&f, &b, 4); return f; }
 int64_t jrt_f2l(float f) {
     if (f != f) return 0;
     if (f >= 9223372036854775807.0f) return INT64_MAX;

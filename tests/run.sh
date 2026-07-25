@@ -240,6 +240,8 @@ if sh "$root/spikes/lwjgl_probe.sh"; then pass=$((pass+1)); else fail=$((fail+1)
 if sh "$root/tests/zipcrc.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/ffi.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/autobind.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/instnative.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/strnative.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/lwjgl.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitmem.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitclass.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi

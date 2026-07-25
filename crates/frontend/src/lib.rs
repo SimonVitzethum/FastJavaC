@@ -937,6 +937,78 @@ fn is_native_method(program: &Program, class: &str, name: &str, desc: &str) -> b
     }
 }
 
+/// Emit the JNI auto-binding for a `native` method call: pop the args (+ receiver
+/// for instance methods), push them via `jrt_jni_arg_*`, then the typed
+/// `jrt_jni_invoke_*` with the mangled `Java_*` symbol. The runtime resolves it in
+/// a System.load-ed lib and libffi-calls it. Shared by static/virtual/special/
+/// interface. Args are owned to avoid borrowing `ml.cf` across the `&mut ml`.
+fn emit_jni_native(
+    program: &mut Program,
+    ml: &mut MethodLowering,
+    stmts: &mut Vec<Statement>,
+    stack: &mut Vec<Ty>,
+    class: &str,
+    name: &str,
+    desc: &str,
+    is_static: bool,
+) -> Result<()> {
+    let sym = jni_symbol(class, name);
+    let argdesc = desc
+        .rsplit_once(')')
+        .map(|(a, _)| a.trim_start_matches('(').to_string())
+        .unwrap_or_default();
+    let (ptys, rty) = parse_descriptor(desc)?;
+    let underflow = || FrontendError::Unsupported("stack underflow (native bind)".into());
+    // Pop args (deepest last), then the receiver for instance methods.
+    let mut argslots: Vec<(Local, Ty)> = Vec::new();
+    for pty in ptys.iter().rev() {
+        let ty = stack.pop().ok_or_else(underflow)?;
+        argslots.push((ml.stack_slot(stack.len(), ty), *pty));
+    }
+    argslots.reverse();
+    let recv = if is_static {
+        Operand::ConstNull
+    } else {
+        let ty = stack.pop().ok_or_else(underflow)?;
+        Operand::Copy(ml.stack_slot(stack.len(), ty))
+    };
+    for (l, ty) in &argslots {
+        let f = match ty {
+            Ty::I32 => "jrt_jni_arg_i",
+            Ty::I64 => "jrt_jni_arg_j",
+            Ty::F32 => "jrt_jni_arg_f",
+            Ty::F64 => "jrt_jni_arg_d",
+            Ty::Ref => "jrt_jni_arg_p",
+            Ty::Void => continue,
+        };
+        stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(*l)] });
+    }
+    let sid = program.intern_string(&sym);
+    let aid = program.intern_string(&argdesc);
+    let invfn = match rty {
+        Ty::I32 => "jrt_jni_invoke_i",
+        Ty::I64 => "jrt_jni_invoke_j",
+        Ty::F32 => "jrt_jni_invoke_f",
+        Ty::F64 => "jrt_jni_invoke_d",
+        Ty::Ref => "jrt_jni_invoke_p",
+        Ty::Void => "jrt_jni_invoke_v",
+    };
+    let iargs = vec![
+        Operand::ConstStr(sid),
+        Operand::ConstStr(aid),
+        Operand::ConstI32(if is_static { 1 } else { 0 }),
+        recv,
+    ];
+    if rty == Ty::Void {
+        stmts.push(Statement::Call { dest: None, func: invfn.to_string(), args: iargs });
+    } else {
+        let dest = ml.stack_slot(stack.len(), rty);
+        stack.push(rty);
+        stmts.push(Statement::Call { dest: Some(dest), func: invfn.to_string(), args: iargs });
+    }
+    Ok(())
+}
+
 /// The `jrt_unsafe_*` helper for a (canonical op, value type). Shared by the
 /// `Unsafe` and `VarHandle` frontends — both bottom out in the same atomic memory
 /// layer (the ref helpers carry the RC store barrier). Canonical ops: get, put,
@@ -2582,6 +2654,11 @@ fn lower_block(
                     continue;
                 }
                 let (class, name, desc) = (class.to_string(), name.to_string(), desc.to_string());
+                // Instance `native` method → JNI auto-bind (receiver as the jobject).
+                if is_native_method(program, &class, &name, &desc) {
+                    emit_jni_native(program, ml, &mut stmts, &mut stack, &class, &name, &desc, false)?;
+                    continue;
+                }
                 // java/lang/Object root methods (equals/hashCode/toString)
                 // dispatch globally via the vtable of each class.
                 let is_object_root = class == "java/lang/Object"
@@ -3386,6 +3463,13 @@ fn lower_block(
                     // Identity hash = the object-header hash (same source as the
                     // default Object.hashCode); null → 0 is handled in the runtime.
                     ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => Some(("jrt_obj_hashcode", Ty::I32)),
+                    // IEEE-754 bit reinterpretation.
+                    ("java/lang/Double", "doubleToRawLongBits", "(D)J") => Some(("jrt_d2rawbits", Ty::I64)),
+                    ("java/lang/Double", "doubleToLongBits", "(D)J") => Some(("jrt_d2rawbits", Ty::I64)),
+                    ("java/lang/Double", "longBitsToDouble", "(J)D") => Some(("jrt_rawbits2d", Ty::F64)),
+                    ("java/lang/Float", "floatToRawIntBits", "(F)I") => Some(("jrt_f2rawbits", Ty::I32)),
+                    ("java/lang/Float", "floatToIntBits", "(F)I") => Some(("jrt_f2rawbits", Ty::I32)),
+                    ("java/lang/Float", "intBitsToFloat", "(I)F") => Some(("jrt_rawbits2f", Ty::F32)),
                     _ => None,
                 };
                 if let Some((func, rty)) = simple {
@@ -3401,53 +3485,10 @@ fn lower_block(
                     continue;
                 }
                 // Auto-bind a static `native` method (no intrinsic) to its Java_*
-                // symbol via the libffi JNI bridge: push args in order, then invoke.
+                // symbol via the libffi JNI bridge.
                 if is_native_method(program, class, name, desc) {
-                    let sym = jni_symbol(class, name);
-                    let argdesc = desc
-                        .rsplit_once(')')
-                        .map(|(a, _)| a.trim_start_matches('(').to_string())
-                        .unwrap_or_default();
-                    let (ptys, rty) = parse_descriptor(desc)?;
-                    let mut argslots: Vec<(Local, Ty)> = Vec::new();
-                    for pty in ptys.iter().rev() {
-                        argslots.push((pop!(), *pty));
-                    }
-                    argslots.reverse();
-                    for (l, ty) in &argslots {
-                        let f = match ty {
-                            Ty::I32 => "jrt_jni_arg_i",
-                            Ty::I64 => "jrt_jni_arg_j",
-                            Ty::F32 => "jrt_jni_arg_f",
-                            Ty::F64 => "jrt_jni_arg_d",
-                            Ty::Ref => "jrt_jni_arg_p",
-                            Ty::Void => continue,
-                        };
-                        stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(*l)] });
-                    }
-                    let sid = program.intern_string(&sym);
-                    let aid = program.intern_string(&argdesc);
-                    let invfn = match rty {
-                        Ty::I32 => "jrt_jni_invoke_i",
-                        Ty::I64 => "jrt_jni_invoke_j",
-                        Ty::F32 => "jrt_jni_invoke_f",
-                        Ty::F64 => "jrt_jni_invoke_d",
-                        Ty::Ref => "jrt_jni_invoke_p",
-                        Ty::Void => "jrt_jni_invoke_v",
-                    };
-                    let iargs = vec![
-                        Operand::ConstStr(sid),
-                        Operand::ConstStr(aid),
-                        Operand::ConstI32(1), // static → jclass(NULL)
-                        Operand::ConstNull,
-                    ];
-                    if rty == Ty::Void {
-                        stmts.push(Statement::Call { dest: None, func: invfn.to_string(), args: iargs });
-                    } else {
-                        let dest = ml.stack_slot(stack.len(), rty);
-                        stack.push(rty);
-                        stmts.push(Statement::Call { dest: Some(dest), func: invfn.to_string(), args: iargs });
-                    }
+                    let (c, n, d) = (class.to_string(), name.to_string(), desc.to_string());
+                    emit_jni_native(program, ml, &mut stmts, &mut stack, &c, &n, &d, true)?;
                     continue;
                 }
                 let (ptys, rty) = parse_descriptor(desc)?;

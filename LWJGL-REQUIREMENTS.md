@@ -59,6 +59,28 @@ LWJGL is **pure Java + one self-contained `liblwjgl.so`** (1969 `Java_*` exports
    rendering (LWJGL bundles `libglfw`; `libGL` is the system's). Off-box/headless can't render.
 5. **Compile the pure-Java LWJGL closure** closed-world (uses lambdas/threads — present).
 
+## Status update (2026-07-25): the software path is DONE
+
+All software prerequisites are implemented and verified on this machine:
+
+1. ✅ **`System.load` + JNI native registration** — an ordinary `native` method (static OR
+   instance) auto-binds to its `Java_<class>_<method>` symbol in a `System.load`-ed lib and is
+   called via the libffi bridge. No per-method glue. (examples/NativeAdd, InstNative; the real
+   unmodified `org.lwjgl.system.MemoryAccessJNI.getPointerSize()` → 8 from the shipped liblwjgl.)
+2. ✅ **libffi invoke bridge** — `jrt_ffi_call`/`jrt_jni_invoke_*` marshal any primitive/long/
+   float/double/pointer signature; one path covers LWJGL's 1605 shapes. (examples/FfiCall, LwjglFfi.)
+3. ✅ **String JNIEnv slots** — `GetStringUTFChars`/`Release`/`NewStringUTF`/`GetStringUTFLength`,
+   so natives take AND return Java strings. (examples/StrNative → 11/upper-case round-trip.)
+   Plus array-critical/region slots already present.
+4. ✅ **`Double`/`Float` bit intrinsics** — `doubleToRawLongBits`/`longBitsToDouble`/
+   `floatToRawIntBits`/`intBitsToFloat`.
+5. ✅ **GLFW loads + is callable** — `System.load(libglfw.so)` (NEEDED only librt/libm/libdl/
+   pthread/libc; it dlopens X11/Wayland lazily) and `glfwInit()` via the FFI returns a valid
+   result. The binding path is complete.
+
+**Only hardware remains:** actual window creation + OpenGL rendering needs a real GPU + display
+(X11/Wayland) — not a code/VM matter. On a headless box you get the calls but no pixels.
+
 ## Verdict
 
 LWJGL is **far more tractable than the JDK native layer**: no `JVM_*` wall, a single
