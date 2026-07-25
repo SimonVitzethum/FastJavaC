@@ -274,6 +274,32 @@ target. The MC *client* (10) is a separate, much larger native-graphics project.
   (every `java.util.function` lambda needs it, and it's buildable without the native layer).
   → **invokedynamic is the correct next unlock, not the native layer.**
 
+## 9b. Milestone-3 (invokedynamic) — measured & essentially CLOSED
+
+Census of **all** invokedynamic call sites across java.base core (3789 classes, 1347 sites):
+
+| Bootstrap factory | sites | status |
+|---|--:|---|
+| `LambdaMetafactory.metafactory`/`altMetafactory` | 1478+16 | ✅ handled (lambda path — **verified end-to-end** on real `java.util.function.IntUnaryOperator`, capturing lambda → correct result) |
+| `ObjectMethods.bootstrap` (records) | 151 | ✅ handled |
+| `SwitchBootstraps.typeSwitch` | 61 | ✅ handled |
+| `SwitchBootstraps.enumSwitch` | 2 | ✅ **now handled** (this change — String label = enum-constant identity, Class label = instanceof, null→−1; test `tests/enumswitch.sh`, matches reference JVM 1/2/9/7) |
+| `StringConcatFactory.makeConcat[WithConstants]` | ~18 | ✅ handled |
+
+**Conclusion:** the invokedynamic *mechanism* is complete for practically all closed-world
+Java (application, collections, streams, records, pattern/enum switch). What the spike
+called "MethodHandles/VarHandle pervasively" turns out to be **signature-polymorphic method
+calls, not indy** — and the base concurrency primitives bottom out in
+`jdk.internal.misc.Unsafe.compareAndSet*` (a **native** method, e.g. `AtomicInteger` uses
+`Unsafe.compareAndSetInt` directly, no VarHandle). So the residual "invoke" work is:
+- **Signature-polymorphic `MethodHandle.invoke/invokeExact` + `VarHandle.{get,set,compareAndSet,…}`** —
+  needed only by the `java.lang.invoke` internals and a few concurrent utilities; most
+  app/JDK code never hits it. Deferred (deep; a dynamic mechanism, unlike the static indy above).
+
+**Net effect on the ladder:** milestone 3 is no longer the gate. With indy closed, the JDK
+gate reverts to **the native layer** (§3 — Unsafe CAS/memory, Object/System/Thread/Class,
+file+socket I/O) plus **core-model completeness** and **closed-world closure**.
+
 ## 10. Recommended first concrete steps (two parallel spikes)
 
 1. **OpenJDK-compile spike (milestone 2):** pick ~a few hundred `java.base` classes

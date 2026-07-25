@@ -2412,9 +2412,85 @@ fn lower_block(
                     continue;
                 }
 
+                // --- Enum-Switch (SwitchBootstraps.enumSwitch) ---
+                // Same shape as typeSwitch, but a String label matches an enum
+                // constant by reference identity (obj == EnumClass.LABEL, the
+                // constant being a static singleton field); a Class label is a
+                // type pattern (instanceof). null → −1, no match → N. Labels are
+                // disjoint (distinct enum constants), so the branch-free sum is
+                // exact.
+                if bsm_name == "enumSwitch" && dname == "enumSwitch" {
+                    // Enum type = first parameter of the invocation descriptor.
+                    let enum_class = descriptor_params(ddesc)?
+                        .first()
+                        .and_then(|p| p.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string()))
+                        .ok_or_else(|| FrontendError::Unsupported("enumSwitch receiver type".into()))?;
+                    enum Label { Const(String), Type(String) }
+                    let labels: Vec<Label> = bsm_args
+                        .iter()
+                        .map(|&i| {
+                            if let Ok(s) = ml.cf.const_string(i) {
+                                Ok(Label::Const(s.to_string()))
+                            } else if let Ok(c) = ml.cf.class_name(i) {
+                                Ok(Label::Type(c.to_string()))
+                            } else {
+                                Err(FrontendError::Unsupported("enumSwitch label kind".into()))
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let n = labels.len() as i32;
+                    let _restart = pop!(); // restart index (0 for simple switches)
+                    let obj = pop!();
+                    let isnull = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(isnull, Rvalue::Binary(BinOp::CmpEq, Operand::Copy(obj), Operand::ConstNull)));
+                    let matched = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(matched, Rvalue::Use(Operand::ConstI32(0))));
+                    let idxsum = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(idxsum, Rvalue::Use(Operand::ConstI32(0))));
+                    for (k, label) in labels.iter().enumerate() {
+                        let inst = ml.fresh(Ty::I32);
+                        match label {
+                            Label::Const(name) => {
+                                let ec = ml.fresh(Ty::Ref);
+                                stmts.push(Statement::GetStatic { dest: ec, class: enum_class.clone(), field: name.clone() });
+                                stmts.push(Statement::Assign(inst, Rvalue::Binary(BinOp::CmpEq, Operand::Copy(obj), Operand::Copy(ec))));
+                            }
+                            Label::Type(c) => {
+                                if program.class(c).is_some() {
+                                    stmts.push(Statement::InstanceOf { dest: inst, obj: Operand::Copy(obj), class: c.clone() });
+                                } else {
+                                    stmts.push(Statement::Assign(inst, Rvalue::Use(Operand::ConstI32(0))));
+                                }
+                            }
+                        }
+                        let nm = ml.fresh(Ty::I32);
+                        stmts.push(Statement::Assign(nm, Rvalue::Binary(BinOp::Add, Operand::Copy(matched), Operand::Copy(inst))));
+                        stmts.push(Statement::Assign(matched, Rvalue::Use(Operand::Copy(nm))));
+                        if k > 0 {
+                            let ki = ml.fresh(Ty::I32);
+                            stmts.push(Statement::Assign(ki, Rvalue::Binary(BinOp::Mul, Operand::Copy(inst), Operand::ConstI32(k as i32))));
+                            let ns = ml.fresh(Ty::I32);
+                            stmts.push(Statement::Assign(ns, Rvalue::Binary(BinOp::Add, Operand::Copy(idxsum), Operand::Copy(ki))));
+                            stmts.push(Statement::Assign(idxsum, Rvalue::Use(Operand::Copy(ns))));
+                        }
+                    }
+                    let notm = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(notm, Rvalue::Binary(BinOp::Sub, Operand::ConstI32(1), Operand::Copy(matched))));
+                    let nmN = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(nmN, Rvalue::Binary(BinOp::Mul, Operand::Copy(notm), Operand::ConstI32(n))));
+                    let r1 = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(r1, Rvalue::Binary(BinOp::Add, Operand::Copy(idxsum), Operand::Copy(nmN))));
+                    let nullpen = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(nullpen, Rvalue::Binary(BinOp::Mul, Operand::Copy(isnull), Operand::ConstI32(n + 1))));
+                    let res = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(res, Rvalue::Binary(BinOp::Sub, Operand::Copy(r1), Operand::Copy(nullpen))));
+                    push!(Ty::I32, Rvalue::Use(Operand::Copy(res)));
+                    continue;
+                }
+
                 if dname != "makeConcatWithConstants" && dname != "makeConcat" {
                     return Err(FrontendError::Unsupported(format!(
-                        "invokedynamic {dname} (supported: string concatenation, lambda, record, pattern switch)"
+                        "invokedynamic {dname} (supported: string concatenation, lambda, record, type/enum switch)"
                     )));
                 }
                 let with_constants = dname == "makeConcatWithConstants";
