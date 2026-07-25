@@ -328,6 +328,7 @@ void *jrt_noop_copy(void *src, void *map); /* deep-copy vtable slot-3 stub */
 void *jrt_alloc(int64_t size);
 void jrt_retain(void *p);
 void jrt_throw_npe(void);
+void jrt_throw_ioexception(void);
 void jrt_throw_bounds(void);
 _Noreturn void jrt_throw_bounds_fatal(void);
 void jrt_throw_sioobe(void);
@@ -2273,6 +2274,7 @@ void *jrt_sentinel_vtable[4] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, N
 static JObjHeader arith_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader npe_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader bounds_exc_obj = {-1, jrt_sentinel_vtable};
+static JObjHeader io_exc_obj = {-1, jrt_sentinel_vtable};
 
 /* --- Debug backtraces (--backtrace, off by default) --------------------------
  * Capture a native backtrace at the THROW ORIGIN (where the stack still holds the
@@ -2328,6 +2330,11 @@ void jrt_throw_bounds(void) {
 }
 void jrt_throw_sioobe(void) {
     throw_runtime(&bounds_exc_obj, "java.lang.StringIndexOutOfBoundsException");
+}
+/* Catchable IOException (file open/…): catch-all against the sentinel, so a Java
+ * catch(IOException)/catch(Exception) grabs it; uncaught → reported and aborts. */
+void jrt_throw_ioexception(void) {
+    throw_runtime(&io_exc_obj, "java.io.IOException");
 }
 
 /* Fatal (noreturn) variants: when the whole program provably has NO handler that
@@ -3398,18 +3405,18 @@ void jrt_fis_open(void *stream, const void *path_j) {
     JFileStream *s = (JFileStream *)stream;
     char path[4096];
     jstr_to_cstr(path_j, path, sizeof path);
-    if (!path[0]) return;
-    int fd = open(path, O_RDONLY);
-    if (fd >= 0) s->fd = fd;
+    int fd = path[0] ? open(path, O_RDONLY) : -1;
+    if (fd >= 0) { s->fd = fd; return; }
+    jrt_throw_ioexception(); /* FileNotFoundException in Java; caught as IOException */
 }
 void jrt_fos_open(void *stream, const void *path_j, int32_t append) {
     JFileStream *s = (JFileStream *)stream;
     char path[4096];
     jstr_to_cstr(path_j, path, sizeof path);
-    if (!path[0]) return;
     int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-    int fd = open(path, flags, 0644);
-    if (fd >= 0) s->fd = fd;
+    int fd = path[0] ? open(path, flags, 0644) : -1;
+    if (fd >= 0) { s->fd = fd; return; }
+    jrt_throw_ioexception();
 }
 /* read one byte: 0..255, or -1 at EOF/error (Java InputStream.read()). */
 int32_t jrt_fis_read(void *stream) {

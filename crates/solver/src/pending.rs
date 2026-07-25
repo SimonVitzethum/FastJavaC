@@ -73,6 +73,8 @@ fn runtime_safe(func: &str) -> bool {
         "jrt_thread_start",
         "jrt_thread_join",
         "jrt_invoke_runnable",
+        "jrt_fis_open",
+        "jrt_fos_open",
     ];
     func.starts_with("jrt_") && !THROWS.contains(&func)
 }

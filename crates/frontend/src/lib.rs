@@ -2006,17 +2006,22 @@ fn lower_block(
                 if (class == "java/io/FileInputStream" || class == "java/io/FileOutputStream")
                     && name == "<init>"
                 {
+                    // A failed open throws a catchable IOException (via the runtime),
+                    // so mark the constructor site as a throwing point.
                     if class == "java/io/FileInputStream" && desc == "(Ljava/lang/String;)V" {
                         stmts.push(Statement::Call { dest: None, func: "jrt_fis_open".into(), args });
+                        throw_after = Some(*pc);
                         continue;
                     }
                     if class == "java/io/FileOutputStream" && desc == "(Ljava/lang/String;)V" {
                         args.push(Operand::ConstI32(0)); // append = false
                         stmts.push(Statement::Call { dest: None, func: "jrt_fos_open".into(), args });
+                        throw_after = Some(*pc);
                         continue;
                     }
                     if class == "java/io/FileOutputStream" && desc == "(Ljava/lang/String;Z)V" {
                         stmts.push(Statement::Call { dest: None, func: "jrt_fos_open".into(), args });
+                        throw_after = Some(*pc);
                         continue;
                     }
                     return Err(FrontendError::Unsupported(format!(
