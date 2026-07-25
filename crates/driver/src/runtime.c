@@ -2760,6 +2760,82 @@ static int cf_cp_wide(const uint8_t *buf, long flen, int idx, int64_t *out) {
     return 0;
 }
 
+/* Read the 4-byte value of a CONSTANT_Integer/Float at cp index `idx` (the ldc/ldc_w
+ * targets we can materialize inline). Returns 1 + raw bits; 0 for out-of-range or for
+ * String/Class/other ldc constants (which need object creation — unsupported here). */
+static int cf_cp_narrow(const uint8_t *buf, long flen, int idx, int32_t *out) {
+    if (!buf || flen < 10 || idx <= 0) return 0;
+    int cpc = cf_be16(buf + 8);
+    long o = 10;
+    for (int i = 1; i < cpc && o + 1 <= flen; i++) {
+        uint8_t tag = buf[o];
+        if (i == idx) {
+            if ((tag == 3 || tag == 4) && o + 5 <= flen) { /* Integer / Float */
+                *out = (int32_t)cf_be32(buf + o + 1);
+                return 1;
+            }
+            return 0; /* String/Class/MethodHandle ldc: unsupported inline */
+        }
+        switch (tag) {
+            case 1: o += 3 + cf_be16(buf + o + 1); break;
+            case 7: case 8: case 16: case 19: case 20: o += 3; break;
+            case 15: o += 4; break;
+            case 5: case 6: o += 9; i++; break;
+            case 3: case 4: case 9: case 10: case 11: case 12:
+            case 17: case 18: o += 5; break;
+            default: return 0;
+        }
+    }
+    return 0;
+}
+
+/* Build the constant-pool resolution tables (Class/Field/Method/NameAndType index maps)
+ * for a class file into `out`, so getfield/putfield/new/invoke/instanceof can resolve
+ * against the FjcClass registry. Allocates the index arrays (pointing INTO `f`, which must
+ * outlive the CpInfo); release with cf_free_cp(). Returns 0 on success, negative on a
+ * malformed/unsupported constant pool (nothing left allocated on failure). Kept separate
+ * from cf_define_class's inline parse so the JIT-run harness gains the same resolution. */
+static int cf_parse_cp(const uint8_t *f, long flen, CpInfo *out) {
+    memset(out, 0, sizeof *out);
+    if (flen < 10 || cf_be32(f) != 0xCAFEBABEu) return -1;
+    uint16_t cpc = cf_be16(f + 8);
+    const uint8_t **u = (const uint8_t **)calloc(cpc, sizeof(void *));
+    int *ul = (int *)calloc(cpc, sizeof(int));
+    uint16_t *cls_ni = (uint16_t *)calloc(cpc, sizeof(uint16_t));
+    uint16_t *ref_class = (uint16_t *)calloc(cpc, sizeof(uint16_t));
+    uint16_t *ref_nat = (uint16_t *)calloc(cpc, sizeof(uint16_t));
+    uint16_t *nat_name = (uint16_t *)calloc(cpc, sizeof(uint16_t));
+    uint16_t *nat_desc = (uint16_t *)calloc(cpc, sizeof(uint16_t));
+#define CF_CP_FREE_LOCAL() do { free(u); free(ul); free(cls_ni); free(ref_class); free(ref_nat); free(nat_name); free(nat_desc); } while (0)
+    if (!u || !ul || !cls_ni || !ref_class || !ref_nat || !nat_name || !nat_desc) { CF_CP_FREE_LOCAL(); return -2; }
+    const uint8_t *p = f + 10;
+    for (int i = 1; i < cpc; i++) {
+        uint8_t tag = *p++;
+        switch (tag) {
+            case 1: { int len = cf_be16(p); u[i] = p + 2; ul[i] = len; p += 2 + len; } break;
+            case 7: cls_ni[i] = cf_be16(p); p += 2; break;
+            case 8: case 16: case 19: case 20: p += 2; break;
+            case 15: p += 3; break;
+            case 9: case 10: case 11: ref_class[i] = cf_be16(p); ref_nat[i] = cf_be16(p + 2); p += 4; break;
+            case 12: nat_name[i] = cf_be16(p); nat_desc[i] = cf_be16(p + 2); p += 4; break;
+            case 3: case 4: case 17: case 18: p += 4; break;
+            case 5: case 6: p += 8; i++; break;
+            default: CF_CP_FREE_LOCAL(); return -3;
+        }
+    }
+#undef CF_CP_FREE_LOCAL
+    out->u = u; out->ul = ul; out->cpc = cpc; out->cls_ni = cls_ni;
+    out->ref_class = ref_class; out->ref_nat = ref_nat;
+    out->nat_name = nat_name; out->nat_desc = nat_desc;
+    out->cf_buf = f; out->cf_len = flen;
+    return 0;
+}
+static void cf_free_cp(CpInfo *cp) {
+    free((void *)cp->u); free((void *)cp->ul); free((void *)cp->cls_ni);
+    free((void *)cp->ref_class); free((void *)cp->ref_nat);
+    free((void *)cp->nat_name); free((void *)cp->nat_desc);
+}
+
 /* Resolve a Fieldref cp index to its byte offset in the object + whether it is 8 bytes
  * wide (long/double/reference) vs 4 (int-family). Looks the declaring class up in the
  * FjcClass registry (which carries field offsets from AOT compilation). Returns 1 on
@@ -2844,8 +2920,9 @@ static void jvm_delta(uint8_t op, const uint8_t *bc, int pc, const CpInfo *cp, i
     *pops = 0; *pushes = 0; *owned = 0;
     switch (op) {
         case 0x01: case 0x02: case 0x03 ... 0x08: case 0x09: case 0x0a: case 0x0b ... 0x0d:
-        case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x14: case 0x15 ... 0x19: case 0x1a ... 0x2d:
-        case 0x59: *pushes = 1; break;                                   /* consts/loads/dup (0x14=ldc2_w) */
+        case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x12: case 0x13: case 0x14:
+        case 0x15 ... 0x19: case 0x1a ... 0x2d:
+        case 0x59: *pushes = 1; break;                                   /* consts/loads/ldc/ldc2_w/dup */
         case 0xbb: *pushes = 1; *owned = 1; break;                       /* new -> owned */
         case 0xbc: case 0xbd: *pops = 1; *pushes = 1; *owned = 1; break; /* newarray/anewarray (count->array, owned) */
         case 0xbe: *pops = 1; *pushes = 1; break;                        /* arraylength */
@@ -2854,11 +2931,11 @@ static void jvm_delta(uint8_t op, const uint8_t *bc, int pc, const CpInfo *cp, i
         case 0x4f: case 0x50: case 0x51: case 0x52: case 0x53:
         case 0x54: case 0x55: case 0x56: *pops = 3; break;               /* *astore */
         case 0x36 ... 0x4e: case 0x57: *pops = 1; break;                 /* stores / pop */
-        case 0x60: case 0x61: case 0x63 ... 0x65: case 0x67 ... 0x69: case 0x6b: case 0x6f:
-        case 0x78 ... 0x83: case 0x94:
-            *pops = 2; *pushes = 1; break;                               /* binary arith / shift / bitwise / lcmp */
-        case 0x74: case 0x75: case 0x85 ... 0x93: case 0xb4: case 0xc0:
-            *pops = 1; *pushes = 1; break;                               /* unary / conv / getfield / checkcast */
+        case 0x60 ... 0x73:                                             /* all i/l/f/d add/sub/mul/div/rem */
+        case 0x78 ... 0x83: case 0x94: case 0x95 ... 0x98:
+            *pops = 2; *pushes = 1; break;                               /* binary arith / shift / bitwise / cmp */
+        case 0x74: case 0x75: case 0x85 ... 0x93: case 0xb4: case 0xc0: case 0xc1:
+            *pops = 1; *pushes = 1; break;                               /* unary / conv / getfield / checkcast / instanceof */
         case 0x58: *pops = 2; break;                                     /* pop2 */
         case 0x5a: *pops = 2; *pushes = 3; break;                        /* dup_x1 */
         case 0xc2: case 0xc3: *pops = 1; break;                          /* monitorenter/exit */
@@ -2927,6 +3004,18 @@ int32_t jrt_caload(void *, int32_t);
 void jrt_castore(void *, int32_t, int32_t);
 int32_t jrt_saload(void *, int32_t);
 void jrt_sastore(void *, int32_t, int32_t);
+/* Checked arithmetic + comparison leaves (defined later) the JIT calls so that
+ * div-by-zero / INT_MIN÷-1 and NaN ordering match the AOT path exactly — one set
+ * of semantics for both executors, no opcode-specific logic duplicated here. */
+int32_t jrt_idiv(int32_t, int32_t);
+int32_t jrt_irem(int32_t, int32_t);
+int64_t jrt_ldiv(int64_t, int64_t);
+int64_t jrt_lrem(int64_t, int64_t);
+int32_t jrt_fcmpl(float, float);
+int32_t jrt_fcmpg(float, float);
+int32_t jrt_dcmpl(double, double);
+int32_t jrt_dcmpg(double, double);
+int32_t jrt_instanceof(void *, void *);
 
 /* Marshal K (<=6) integer/reference operand-stack args into the native argument
  * registers (arg0->RDI ... arg5->R9). arg0 is deepest ([rsp+8*(K-1)]), argK-1 at [rsp]. */
@@ -3023,6 +3112,20 @@ static void emit_call_jrt(const void *fn, int nargs, int push_result) {
     if (push_result) je1(0x50);                    /* push rax */
 }
 
+/* Native-call a runtime helper whose signature is given by a JVM descriptor: marshals
+ * K operand-stack args (int/ref -> RDI.., float/double -> XMM..) and pushes the typed
+ * result. Used for the fcmp/dcmp leaves (float/double in, int out). */
+static void emit_call_jrt_desc(const void *fn, const char *desc, int K) {
+    emit_native_marshal_desc(desc, K, 0);
+    jeN("\x48\x89\xE5", 3);                        /* mov rbp, rsp */
+    jeN("\x48\x83\xE4\xF0", 4);                    /* and rsp, -16 */
+    je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)fn); /* mov rax, fn */
+    jeN("\xFF\xD0", 2);                            /* call rax */
+    jeN("\x48\x89\xEC", 3);                        /* mov rsp, rbp */
+    if (K > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * K); } /* pop args */
+    emit_push_ret(ret_char(desc));
+}
+
 static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int nexc, const CpInfo *cp,
                              const char *selfdesc, int self_static, int max_locals) {
     if (n <= 0 || n >= (1 << 16)) return NULL;
@@ -3060,6 +3163,13 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x60: je1(0x58); jeN("\x01\x04\x24", 3); pc++; break;               /* iadd */
             case 0x64: je1(0x58); jeN("\x29\x04\x24", 3); pc++; break;               /* isub */
             case 0x68: je1(0x58); jeN("\x0F\xAF\x04\x24", 4); jeN("\x89\x04\x24", 3); pc++; break; /* imul */
+            /* idiv/irem/ldiv/lrem: call the checked leaves (div-by-zero throw + MIN/-1),
+             * so semantics match AOT and no CPU #DE can crash JITted code. args a,b at
+             * [rsp+8],[rsp] -> RDI,RSI; result in rax. */
+            case 0x6c: emit_call_jrt((const void *)&jrt_idiv, 2, 1); pc++; break; /* idiv */
+            case 0x70: emit_call_jrt((const void *)&jrt_irem, 2, 1); pc++; break; /* irem */
+            case 0x6d: emit_call_jrt((const void *)&jrt_ldiv, 2, 1); pc++; break; /* ldiv */
+            case 0x71: emit_call_jrt((const void *)&jrt_lrem, 2, 1); pc++; break; /* lrem */
             case 0x74: jeN("\xF7\x1C\x24", 3); pc++; break;                          /* ineg */
             case 0x84: { int idx = bc[pc + 1]; int32_t c = (int8_t)bc[pc + 2]; je1(0x81); je1(0x43); je1((unsigned char)(8 * idx)); je_i32(c); pc += 3; break; } /* iinc */
             case 0x59: jeN("\xFF\x34\x24", 3); pc++; break;                          /* dup */
@@ -3091,6 +3201,12 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             /* lcmp: v1,v2 -> sign(v1-v2) as -1/0/1 (branchless: setg - setl) */
             case 0x94: je1(0x58); je1(0x59); jeN("\x48\x39\xC1", 3); jeN("\x0F\x9F\xC2", 3);
                        jeN("\x0F\x9C\xC0", 3); jeN("\x28\xC2", 2); jeN("\x48\x0F\xBE\xC2", 4); je1(0x50); pc++; break;
+            /* fcmpl/fcmpg/dcmpl/dcmpg: the l/g variants differ only on NaN (JVMS 6.5);
+             * the leaves encode that, called with float/double args via xmm. */
+            case 0x95: emit_call_jrt_desc((const void *)&jrt_fcmpl, "(FF)I", 2); pc++; break; /* fcmpl */
+            case 0x96: emit_call_jrt_desc((const void *)&jrt_fcmpg, "(FF)I", 2); pc++; break; /* fcmpg */
+            case 0x97: emit_call_jrt_desc((const void *)&jrt_dcmpl, "(DD)I", 2); pc++; break; /* dcmpl */
+            case 0x98: emit_call_jrt_desc((const void *)&jrt_dcmpg, "(DD)I", 2); pc++; break; /* dcmpg */
             /* monitorenter/exit: single-thread no-op (drop the objectref) */
             case 0xc2: case 0xc3: jeN("\x48\x83\xC4\x08", 4); pc++; break;
             case 0xa7: je_jmp(pc + je_s16(bc + pc + 1)); pc += 3; break;             /* goto */
@@ -3129,6 +3245,12 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             /* --- doubles (64-bit slots holding the bit pattern; arithmetic via xmm) --- */
             case 0x0e: je_push_imm(0); pc++; break;                                  /* dconst_0 (bits of 0.0) */
             case 0x0f: je_push_imm64((int64_t)0x3FF0000000000000LL); pc++; break;    /* dconst_1 (bits of 1.0) */
+            case 0x12: case 0x13: { /* ldc / ldc_w: int/float constant (String/Class refs unsupported) */
+                int cidx = (op == 0x12) ? bc[pc + 1] : ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int32_t v;
+                if (!cp || !cf_cp_narrow(cp->cf_buf, cp->cf_len, cidx, &v)) return NULL;
+                je_push_imm(v); pc += (op == 0x12) ? 2 : 3; break;
+            }
             case 0x14: { /* ldc2_w: Long/Double constant from the constant pool */
                 int cidx = (bc[pc + 1] << 8) | bc[pc + 2];
                 int64_t v;
@@ -3186,6 +3308,21 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 je_jmp(handler); pc++; break;
             }
             case 0xc0: pc += 3; break; /* checkcast: trusted no-op (leaves the ref) */
+            case 0xc1: { /* instanceof: push (objref instanceof T) ? 1 : 0 */
+                const FjcClass *tc = jit_resolve_class(cp, (bc[pc + 1] << 8) | bc[pc + 2]);
+                if (!tc || !tc->vtable) return NULL;            /* need a materialized type descriptor */
+                void *td = ((void *const *)tc->vtable)[2];      /* vtable[2] = TypeDesc* (cf. jrt_instanceof) */
+                if (!td) return NULL;
+                je1(0x5F);                                      /* pop rdi (objref) */
+                je1(0x48); je1(0xBE); je_i64((int64_t)(uintptr_t)td); /* mov rsi, td */
+                jeN("\x48\x89\xE5", 3);                          /* mov rbp, rsp */
+                jeN("\x48\x83\xE4\xF0", 4);                      /* and rsp, -16 */
+                je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)&jrt_instanceof); /* mov rax, fn */
+                jeN("\xFF\xD0", 2);                              /* call rax */
+                jeN("\x48\x89\xEC", 3);                          /* mov rsp, rbp */
+                je1(0x50);                                       /* push rax (0/1) */
+                pc += 3; break;
+            }
             /* --- arrays (int + reference; via runtime helpers, which bounds-check) --- */
             case 0xbc: { /* newarray <atype>: all primitive element widths */
                 int elem;
@@ -3226,6 +3363,14 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
             case 0x55: emit_call_jrt((const void *)&jrt_castore, 3, 0); pc++; break; /* castore */
             case 0x35: emit_call_jrt((const void *)&jrt_saload, 2, 1); pc++; break;  /* saload */
             case 0x56: emit_call_jrt((const void *)&jrt_sastore, 3, 0); pc++; break; /* sastore */
+            /* float/double arrays: the JIT keeps floats/doubles as raw bits in the
+             * 64-bit operand slots, and float[]/double[] have 4/8-byte element stride,
+             * so the int/long array leaves move exactly the right bytes (bit-identical
+             * to a real f/daload). No xmm needed — pure memory move. */
+            case 0x30: emit_call_jrt((const void *)&jrt_iaload, 2, 1); pc++; break;  /* faload  = iaload  (4B bits) */
+            case 0x51: emit_call_jrt((const void *)&jrt_iastore, 3, 0); pc++; break; /* fastore = iastore (4B bits) */
+            case 0x31: emit_call_jrt((const void *)&jrt_laload, 2, 1); pc++; break;  /* daload  = laload  (8B bits) */
+            case 0x52: emit_call_jrt((const void *)&jrt_lastore, 3, 0); pc++; break; /* dastore = lastore (8B bits) */
             /* long<->float/double conversions (pop value, convert via xmm, push;
              * i2f/i2d/f2i/f2d/d2i/d2f already handled above. Narrowing uses cvtt,
              * consistent with the existing f2i/d2i. */
@@ -3435,11 +3580,16 @@ int32_t jrt_jit_run(const void *path_j, const void *mname_j, const void *mdesc_j
     const uint8_t *code = cf_find_code(buf, flen, mname, mdesc, &codelen, &jexc, &njexc, &jmaxloc);
     if (!code || codelen <= 0) { free(buf); return -6; }
     /* jrt_jit_run targets a static (arg)I method; native entry receives arg in RDI.
-     * A minimal CpInfo carries the classfile so ldc2_w (long/double constants)
-     * resolves; field/method resolution stays disabled (NULL tables → graceful bail). */
-    CpInfo cpi; memset(&cpi, 0, sizeof cpi); cpi.cf_buf = buf; cpi.cf_len = flen;
+     * Build the full CpInfo so field/method/class resolution works exactly as in the
+     * defineClass path — getfield/putfield/new/invoke/instanceof resolve against the
+     * registry. Falls back to a classfile-only CpInfo (ldc2_w still resolves) if the CP
+     * is malformed. */
+    CpInfo cpi;
+    int have_cp = (cf_parse_cp(buf, flen, &cpi) == 0);
+    if (!have_cp) { memset(&cpi, 0, sizeof cpi); cpi.cf_buf = buf; cpi.cf_len = flen; }
     jit_fn fn = jit_compile_bc(code, codelen, jexc, njexc, &cpi, mdesc, 1, jmaxloc);
-    free(buf); /* bytecode already copied into the JITted page */
+    if (have_cp) cf_free_cp(&cpi);
+    free(buf); /* bytecode already copied into the JITted page; CP tables freed above */
     if (!fn) return -7;
     return ((int32_t (*)(int64_t))(void *)fn)((int64_t)arg);
 }
@@ -3650,7 +3800,7 @@ static int cf_define_class(const uint8_t *f, long flen) {
             default: CF_FREE_CP(); return -3;
         }
     }
-    CpInfo cpinfo = { u, ul, cpc, cls_ni, ref_class, ref_nat, nat_name, nat_desc };
+    CpInfo cpinfo = { u, ul, cpc, cls_ni, ref_class, ref_nat, nat_name, nat_desc, f, flen };
     uint16_t this_class = cf_be16(p + 2);          /* after access(2) */
     uint16_t super_class = cf_be16(p + 4);
     p += 6;                                        /* access, this, super */

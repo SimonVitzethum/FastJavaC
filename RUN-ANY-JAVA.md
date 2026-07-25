@@ -18,7 +18,7 @@ Legend below: ✅ done · 🟡 partial · ⬜ not started.
 
 The JVM instruction set is a *fixed* ~200 opcodes. Two executors:
 - **AOT** (fastjavac frontend → LLVM): ✅ covers essentially all opcodes (the JDK census found 0 gaps after i2b/i2c/i2s/dup_x1). Closed-world devirt, RC, escape analysis.
-- **Tier-1 JIT** (in-runtime copy-and-patch, for code loaded at runtime): 🟡 ~150/168 opcodes — int/long/float/double, arrays, control flow, calls, exceptions, shifts/bitwise/conversions, `ldc2_w`. Gaps: `getstatic`/`putstatic`, `instanceof`, `idiv`/`irem` (div-by-zero throw), `invokedynamic`, typed float arrays, `fcmp`/`dcmp`.
+- **Tier-1 JIT** (in-runtime copy-and-patch, for code loaded at runtime): 🟡 int/long/float/double, arrays (incl. typed float/double), control flow, calls, exceptions, shifts/bitwise/conversions, `ldc`/`ldc_w`/`ldc2_w`, `idiv`/`irem`/`ldiv`/`lrem` (checked), `fcmp`/`dcmp`, `instanceof`, and `new`/`getfield`/`invoke*` resolved against the registry in both the defineClass and JIT-run paths. Gaps: `getstatic`/`putstatic` (needs static-field addresses in the registry), `invokedynamic`.
 
 **Needed for "any program":** finish the JIT gaps + wire its symbolic resolution
 (getstatic/invoke resolve against the FjcClass registry) so it can compile arbitrary

@@ -20,13 +20,16 @@ Status: 🟡 partial · ⬜ not started. (Done items are not listed.)
   can power these.
 - 🟡 **Tier-1 JIT: symbolic resolution + remaining opcodes** so it can compile *arbitrary*
   loaded bytecode (not just self-contained methods). This is the load-any-jar unlock.
-  - ⬜ `getstatic` / `putstatic` (resolve the static field address via the registry)
-  - ⬜ `instanceof` (typedesc walk)
+  - ⬜ `getstatic` / `putstatic` — needs the backend to publish static-field storage
+    addresses in the FjcClass registry (currently only instance-field offsets are there).
+  - ✅ `instanceof` (resolves the class → vtable[2] TypeDesc → `jrt_instanceof` walk)
   - ⬜ `invokedynamic` in the JIT (bootstrap)
-  - ⬜ `idiv`/`irem`/`ldiv`/`lrem` (needs the div-by-zero throw)
-  - ⬜ typed float/double arrays (`faload`/`daload`/`fastore`/`dastore` — xmm marshalling)
-  - ⬜ `fcmp`/`dcmp` (NaN l/g variants)
-  - ⬜ resolve `invokevirtual`/`getfield` against the registry for cross-class dynamic code
+  - ✅ `idiv`/`irem`/`ldiv`/`lrem` (call the checked leaves — div-by-zero throws, no SIGFPE)
+  - ✅ typed float/double arrays (`faload`/`daload`/`fastore`/`dastore` — raw-bit moves)
+  - ✅ `fcmp`/`dcmp` (NaN l/g variants via the comparison leaves)
+  - ✅ `ldc`/`ldc_w` int/float constants (narrow constant-pool reader)
+  - ✅ resolve `new`/`getfield`/`putfield`/`invoke*`/`instanceof` against the registry in the
+    JIT-run harness too (the full CpInfo is now built there, not only in defineClass)
 
 ## P1 — Core completeness (broadly useful, bounded)
 
