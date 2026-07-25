@@ -2886,6 +2886,56 @@ static void emit_native_marshal(int K) {
     for (int i = 0; i < K; i++) { jeN(movs[i], 4); je_i32(8 * (K - 1 - i)); }
 }
 
+/* Can a call with this descriptor be marshalled to the native ABI (<=6 int/ref/long args
+ * in integer regs, <=8 float/double args in xmm)? has_recv adds the receiver as an int arg. */
+static int marshal_feasible(const char *desc, int has_recv) {
+    int ireg = has_recv ? 1 : 0, freg = 0;
+    const char *p = desc; if (*p == '(') p++;
+    while (*p && *p != ')') {
+        char t = *p;
+        if (t == '[') { while (*p == '[') p++; t = *p; }
+        if (t == 'L') { while (*p && *p != ';') p++; if (*p) p++; ireg++; }
+        else if (t == 'F' || t == 'D') { freg++; p++; }
+        else { ireg++; p++; }
+    }
+    return ireg <= 6 && freg <= 8;
+}
+
+/* Marshal args (descriptor-driven) into the native registers: int/ref/long -> RDI..R9,
+ * float/double -> XMM0..7. arg i sits at operand offset 8*(K-1-i); K is the total arg count
+ * (our 1-slot-per-value model). Assumes marshal_feasible() already passed. */
+static void emit_native_marshal_desc(const char *desc, int K, int has_recv) {
+    static const char *imov[6] = { "\x48\x8B\xBC\x24", "\x48\x8B\xB4\x24", "\x48\x8B\x94\x24",
+                                   "\x48\x8B\x8C\x24", "\x4C\x8B\x84\x24", "\x4C\x8B\x8C\x24" };
+    static const unsigned char fmodrm[8] = { 0x84, 0x8C, 0x94, 0x9C, 0xA4, 0xAC, 0xB4, 0xBC };
+    int ireg = 0, freg = 0, argi = 0;
+    if (has_recv) { jeN(imov[ireg++], 4); je_i32(8 * (K - 1 - argi)); argi++; }
+    const char *p = desc; if (*p == '(') p++;
+    while (*p && *p != ')') {
+        char t = *p;
+        if (t == '[') { while (*p == '[') p++; t = *p; if (t == 'L') { while (*p && *p != ';') p++; } if (*p) p++; t = 'L'; }
+        else if (t == 'L') { while (*p && *p != ';') p++; if (*p) p++; t = 'L'; }
+        else p++;
+        int off = 8 * (K - 1 - argi);
+        if (t == 'F') { jeN("\xF3\x0F\x10", 3); je1(fmodrm[freg++]); je1(0x24); je_i32(off); }      /* movss xmm,[rsp+off] */
+        else if (t == 'D') { jeN("\xF2\x0F\x10", 3); je1(fmodrm[freg++]); je1(0x24); je_i32(off); } /* movsd xmm,[rsp+off] */
+        else { jeN(imov[ireg++], 4); je_i32(off); }                                                /* mov ireg,[rsp+off] */
+        argi++;
+    }
+}
+
+/* Descriptor return type. */
+static char ret_char(const char *d) { const char *p = d; while (*p && *p != ')') p++; return *p == ')' ? p[1] : 'V'; }
+
+/* Push a call's result onto the operand stack from the ABI return register: RAX for
+ * int/ref/long, XMM0 for float/double (stored back into an 8-byte slot). */
+static void emit_push_ret(char rc) {
+    if (rc == 'V') return;
+    if (rc == 'D') { jeN("\x48\x83\xEC\x08", 4); jeN("\xF2\x0F\x11\x04\x24", 5); }      /* sub rsp,8; movsd [rsp],xmm0 */
+    else if (rc == 'F') { jeN("\x48\x83\xEC\x08", 4); jeN("\xF3\x0F\x11\x04\x24", 5); } /* sub rsp,8; movss [rsp],xmm0 */
+    else je1(0x50);                                                                     /* push rax */
+}
+
 /* Native-call a runtime helper `fn` with `nargs` int/ref operand-stack args; pop them and
  * (optionally) push the return value. */
 static void emit_call_jrt(const void *fn, int nargs, int push_result) {
@@ -2982,7 +3032,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 jeN("\x66\x0F\xD6\x04\x24", 5); /* movq [rsp], xmm0 */
                 pc++; break;
             }
-            case 0xaf: jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je_ret(); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
+            case 0xaf: emit_release_ref_locals(lown, 0); jeN("\xF3\x0F\x7E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je_ret(); pc++; break; /* dreturn: movq xmm0,[rsp]; add rsp,8; ret */
             case 0x87: je1(0x58); jeN("\xF2\x0F\x2A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* i2d: cvtsi2sd xmm0,eax; movq rax,xmm0; push */
             case 0x8e: je1(0x58); jeN("\x66\x48\x0F\x6E\xC0", 5); jeN("\xF2\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* d2i: movq xmm0,rax; cvttsd2si eax,xmm0; push */
             /* --- floats (32-bit; low 32 of a slot holds the bits; arithmetic via xmm ss) --- */
@@ -3002,7 +3052,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 jeN("\x66\x0F\x7E\x04\x24", 5); /* movd [rsp], xmm0 */
                 pc++; break;
             }
-            case 0xae: jeN("\x66\x0F\x6E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je_ret(); pc++; break; /* freturn: movd xmm0,[rsp]; add rsp,8; ret */
+            case 0xae: emit_release_ref_locals(lown, 0); jeN("\x66\x0F\x6E\x04\x24", 5); jeN("\x48\x83\xC4\x08", 4); je_ret(); pc++; break; /* freturn: movd xmm0,[rsp]; add rsp,8; ret */
             case 0x86: je1(0x58); jeN("\xF3\x0F\x2A\xC0", 4); jeN("\x66\x0F\x7E\xC0", 4); je1(0x50); pc++; break; /* i2f */
             case 0x8b: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x0F\x2C\xC0", 4); je1(0x50); pc++; break; /* f2i */
             case 0x8d: je1(0x58); jeN("\x66\x0F\x6E\xC0", 4); jeN("\xF3\x0F\x5A\xC0", 4); jeN("\x66\x48\x0F\x7E\xC0", 5); je1(0x50); pc++; break; /* f2d */
@@ -3091,15 +3141,15 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                  * native registers so `this`/args reach it correctly (Blocker 2 fix for
                  * static/special calls). JIT callees (locals-array ABI, bit2 set) use the
                  * frame path below. Float/double args or >6 args fall back / are unsupported. */
-                if (m->code && !(m->flags & 4) && K <= 6 && !desc_has_fp_args(mdesc)) {
-                    emit_native_marshal(K);
+                if (m->code && !(m->flags & 4) && marshal_feasible(mdesc, op == 0xb7)) {
+                    emit_native_marshal_desc(mdesc, K, op == 0xb7);
                     jeN("\x48\x89\xE5", 3);                        /* mov rbp, rsp */
                     jeN("\x48\x83\xE4\xF0", 4);                    /* and rsp, -16 */
                     je1(0x48); je1(0xB8); je_i64((int64_t)(uintptr_t)m->code); /* mov rax, code */
                     jeN("\xFF\xD0", 2);                            /* call rax */
                     jeN("\x48\x89\xEC", 3);                        /* mov rsp, rbp */
                     if (K > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * K); } /* pop args */
-                    if (!voidret) je1(0x50);                       /* push result */
+                    emit_push_ret(ret_char(mdesc));                       /* push result */
                     pc += 3; break;
                 }
                 /* Callee frame (528 B): [rsp]=saved our-RDI, [rsp+8..)=callee locals (64 slots).
@@ -3119,7 +3169,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 jeN("\x48\x8B\x3C\x24", 4);                        /* mov rdi,[rsp] (restore) */
                 je1(0x48); je1(0x81); je1(0xC4); je_i32(528);      /* add rsp,528 */
                 if (K > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * K); } /* add rsp,8K (pop args) */
-                if (!voidret) je1(0x50);                           /* push rax (result) */
+                emit_push_ret(ret_char(mdesc));                           /* push rax (result) */
                 pc += 3; break;
             }
             /* --- invokevirtual / invokeinterface: dispatch through the RECEIVER's vtable
@@ -3132,13 +3182,13 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 int voidret = 0, kargs = jit_arg_count(mdesc, &voidret);
                 if (kargs < 0) return NULL;
                 int K = kargs + 1; /* + receiver (arg0) */
-                if (K > 6 || desc_has_fp_args(mdesc)) return NULL; /* native marshaller: <=6 int/ref args */
+                if (!marshal_feasible(mdesc, 1)) return NULL; /* too many int/fp args for the register ABI */
                 int slot = m->vtable_index;
                 /* Native ABI: marshal args into registers (RDI = receiver), then load the
                  * actual code from receiver->vtable[slot] and call it. Correct for AOT vtable
                  * methods (which use native args). A JIT-defined override in a slot would need
                  * the locals-array ABI — not yet reconciled here (see roadmap Blocker 2). */
-                emit_native_marshal(K);
+                emit_native_marshal_desc(mdesc, K, 1);
                 jeN("\x48\x8B\x47\x08", 4);                        /* mov rax,[rdi+8]  (vtable) */
                 jeN("\x48\x8B\x80", 3); je_i32(8 * slot);          /* mov rax,[rax+8*slot] (code) */
                 jeN("\x48\x89\xE5", 3);                            /* mov rbp, rsp */
@@ -3146,7 +3196,7 @@ static jit_fn jit_compile_bc(const uint8_t *bc, int n, const uint8_t *exc, int n
                 jeN("\xFF\xD0", 2);                                /* call rax */
                 jeN("\x48\x89\xEC", 3);                            /* mov rsp, rbp */
                 if (K > 0) { je1(0x48); je1(0x81); je1(0xC4); je_i32(8 * K); } /* pop args */
-                if (!voidret) je1(0x50);                           /* push result */
+                emit_push_ret(ret_char(mdesc));                           /* push result */
                 pc += (op == 0xb9) ? 5 : 3; break;                /* invokeinterface has 2 extra operand bytes */
             }
             default: return NULL; /* unsupported opcode */
