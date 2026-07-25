@@ -4082,12 +4082,26 @@ static const FjcMethod *jni_find_method(const FjcClass *c, const char *name, con
 static void *jni_bridge_getmethodid(void *e, void *cls, const char *name, const char *sig) {
     (void)e; return (void *)jni_find_method((const FjcClass *)cls, name, sig);
 }
+static void *jni_method_fn(void *recv, const FjcMethod *m) {
+    if (recv && m->vtable_index >= 0) return (*(void ***)((char *)recv + 8))[m->vtable_index];
+    return (void *)m->code;   /* static / <init> / non-virtual: exact entry */
+}
+static int64_t jni_dispatch(void *fn, ffi_type **at, void **av, int n, char ret) {
+    ffi_cif cif;
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, ffi_of(ret), at) != FFI_OK) return 0;
+    union { ffi_arg a; int64_t j; float f; double d; } r; r.j = 0;
+    ffi_call(&cif, FFI_FN(fn), &r, av);
+    switch (ret) {
+        case 'V': return 0;
+        case 'F': { int32_t b; memcpy(&b, &r.f, 4); return (int64_t)b; }
+        case 'D': { int64_t b; memcpy(&b, &r.d, 8); return b; }
+        default:  return (int64_t)r.a;
+    }
+}
+/* varargs arg source (JNI promotes: int/double; float as double) */
 static int64_t jni_call_va(void *recv, const FjcMethod *m, va_list ap, char ret) {
     if (!m) return 0;
-    void *fn;
-    if (recv && m->vtable_index >= 0) fn = (*(void ***)((char *)recv + 8))[m->vtable_index];
-    else fn = (void *)m->code;
-    if (!fn) return 0;
+    void *fn = jni_method_fn(recv, m); if (!fn) return 0;
     const char *p = m->desc; if (*p == '(') p++;
     ffi_type *at[34]; void *av[34];
     union { int32_t i; int64_t j; float f; double d; void *p; } st[34];
@@ -4106,40 +4120,86 @@ static int64_t jni_call_va(void *recv, const FjcMethod *m, va_list ap, char ret)
         }
         n++; p++;
     }
-    ffi_cif cif;
-    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, ffi_of(ret), at) != FFI_OK) return 0;
-    union { ffi_arg a; int64_t j; float f; double d; } r; r.j = 0;
-    ffi_call(&cif, FFI_FN(fn), &r, av);
-    switch (ret) {
-        case 'V': return 0;
-        case 'F': { int32_t b; memcpy(&b, &r.f, 4); return (int64_t)b; }
-        case 'D': { int64_t b; memcpy(&b, &r.d, 8); return b; }
-        default:  return (int64_t)r.a;
-    }
+    return jni_dispatch(fn, at, av, n, ret);
 }
-/* instance Call<T>Method(env, obj, mid, …); static CallStatic<T>Method(env, cls, mid, …). */
-#define CALLI(nm, RT, RC, CH) \
-  RT jni_##nm(void *e, void *o, void *m, ...) { (void)e; va_list ap; va_start(ap, m); \
-    int64_t r = jni_call_va(o, (const FjcMethod *)m, ap, CH); va_end(ap); RC }
-#define CALLS(nm, RT, RC, CH) \
-  RT jni_##nm(void *e, void *c, void *m, ...) { (void)e; (void)c; va_list ap; va_start(ap, m); \
-    int64_t r = jni_call_va(NULL, (const FjcMethod *)m, ap, CH); va_end(ap); RC }
+/* jvalue[] arg source (exact types, no promotion; each jvalue is 8 bytes) */
+static int64_t jni_call_a(void *recv, const FjcMethod *m, const void *jargs, char ret) {
+    if (!m) return 0;
+    void *fn = jni_method_fn(recv, m); if (!fn) return 0;
+    const char *p = m->desc; if (*p == '(') p++;
+    ffi_type *at[34]; void *av[34];
+    union { int32_t i; void *p; } st[34];
+    const char *ja = (const char *)jargs;
+    int n = 0, ai = 0;
+    if (recv) { at[n] = &ffi_type_pointer; st[n].p = recv; av[n] = &st[n].p; n++; }
+    while (*p && *p != ')' && n < 34) {
+        char kind = *p;
+        if (*p == '[') { while (*p == '[') p++; kind = 'L'; if (*p == 'L') { while (*p && *p != ';') p++; } }
+        else if (*p == 'L') { kind = 'L'; while (*p && *p != ';') p++; }
+        const void *slot = ja + (size_t)ai * 8;   /* jvalue is 8 bytes */
+        switch (kind) {
+            case 'J': at[n] = &ffi_type_sint64; av[n] = (void *)slot; break;
+            case 'F': at[n] = &ffi_type_float;  av[n] = (void *)slot; break;
+            case 'D': at[n] = &ffi_type_double; av[n] = (void *)slot; break;
+            case 'L': at[n] = &ffi_type_pointer; av[n] = (void *)slot; break;
+            case 'I': at[n] = &ffi_type_sint32; av[n] = (void *)slot; break;
+            /* sub-int jvalues occupy only 1-2 bytes → extend into an int32 slot */
+            case 'Z': case 'B': st[n].i = *(const int8_t *)slot; at[n] = &ffi_type_sint32; av[n] = &st[n].i; break;
+            case 'C': st[n].i = *(const uint16_t *)slot; at[n] = &ffi_type_sint32; av[n] = &st[n].i; break;
+            case 'S': st[n].i = *(const int16_t *)slot; at[n] = &ffi_type_sint32; av[n] = &st[n].i; break;
+            default:  at[n] = &ffi_type_sint32; av[n] = (void *)slot; break;
+        }
+        n++; ai++; p++;
+    }
+    return jni_dispatch(fn, at, av, n, ret);
+}
+/* Call<T>Method (varargs / …V va_list / …A jvalue[]) + static variants — all 6 per
+ * return type, generated. Instance calls dispatch virtually; static via m->code. */
 #define RI  return (int32_t)r;
 #define RJ  return r;
 #define RB  return (int8_t)r;
-#define RP  return jni_local((void *)(intptr_t)r);   /* returned object → current local frame */
+#define RP  return jni_local((void *)(intptr_t)r);   /* returned object → local frame */
 #define RV  (void)r; return;
 #define RD  { double d; memcpy(&d, &r, 8); return d; }
 #define RF  { int32_t x = (int32_t)r; float f; memcpy(&f, &x, 4); return f; }
-CALLI(CallVoidMethod, void, RV, 'V')      CALLS(CallStaticVoidMethod, void, RV, 'V')
-CALLI(CallIntMethod, int32_t, RI, 'I')    CALLS(CallStaticIntMethod, int32_t, RI, 'I')
-CALLI(CallLongMethod, int64_t, RJ, 'J')   CALLS(CallStaticLongMethod, int64_t, RJ, 'J')
-CALLI(CallBooleanMethod, int8_t, RB, 'Z') CALLS(CallStaticBooleanMethod, int8_t, RB, 'Z')
-CALLI(CallObjectMethod, void *, RP, 'L')  CALLS(CallStaticObjectMethod, void *, RP, 'L')
-CALLI(CallDoubleMethod, double, RD, 'D')  CALLS(CallStaticDoubleMethod, double, RD, 'D')
-CALLI(CallFloatMethod, float, RF, 'F')    CALLS(CallStaticFloatMethod, float, RF, 'F')
-#undef CALLI
-#undef CALLS
+#define CALLSET(NM, RT, RC, CH) \
+  RT jni_Call##NM##Method(void *e, void *o, void *m, ...) { (void)e; va_list ap; va_start(ap, m); int64_t r = jni_call_va(o, (const FjcMethod *)m, ap, CH); va_end(ap); RC } \
+  RT jni_Call##NM##MethodV(void *e, void *o, void *m, va_list ap) { (void)e; int64_t r = jni_call_va(o, (const FjcMethod *)m, ap, CH); RC } \
+  RT jni_Call##NM##MethodA(void *e, void *o, void *m, const void *a) { (void)e; int64_t r = jni_call_a(o, (const FjcMethod *)m, a, CH); RC } \
+  RT jni_CallStatic##NM##Method(void *e, void *c, void *m, ...) { (void)e; (void)c; va_list ap; va_start(ap, m); int64_t r = jni_call_va(NULL, (const FjcMethod *)m, ap, CH); va_end(ap); RC } \
+  RT jni_CallStatic##NM##MethodV(void *e, void *c, void *m, va_list ap) { (void)e; (void)c; int64_t r = jni_call_va(NULL, (const FjcMethod *)m, ap, CH); RC } \
+  RT jni_CallStatic##NM##MethodA(void *e, void *c, void *m, const void *a) { (void)e; (void)c; int64_t r = jni_call_a(NULL, (const FjcMethod *)m, a, CH); RC }
+CALLSET(Void, void, RV, 'V')
+CALLSET(Int, int32_t, RI, 'I')
+CALLSET(Long, int64_t, RJ, 'J')
+CALLSET(Boolean, int8_t, RB, 'Z')
+CALLSET(Object, void *, RP, 'L')
+CALLSET(Double, double, RD, 'D')
+CALLSET(Float, float, RF, 'F')
+#undef CALLSET
+
+/* NewObject: allocate an instance (jrt_alloc → refcount 1, tracked), set its vtable,
+ * run the <init> ctor with the args, return the object (registered as a local ref). */
+static void *jni_alloc_init(void *cls, const FjcMethod *ctor) {
+    const FjcClass *c = (const FjcClass *)cls;
+    if (!c || !ctor || !c->vtable) return NULL;
+    void *obj = jrt_alloc((int64_t)c->instance_size);
+    if (obj) *(void **)((char *)obj + 8) = (void *)c->vtable;
+    return obj;
+}
+void *jni_NewObject(void *e, void *cls, void *mid, ...) {
+    (void)e; void *obj = jni_alloc_init(cls, (const FjcMethod *)mid); if (!obj) return NULL;
+    va_list ap; va_start(ap, mid); jni_call_va(obj, (const FjcMethod *)mid, ap, 'V'); va_end(ap);
+    return jni_local(obj);
+}
+void *jni_NewObjectV(void *e, void *cls, void *mid, va_list ap) {
+    (void)e; void *obj = jni_alloc_init(cls, (const FjcMethod *)mid); if (!obj) return NULL;
+    jni_call_va(obj, (const FjcMethod *)mid, ap, 'V'); return jni_local(obj);
+}
+void *jni_NewObjectA(void *e, void *cls, void *mid, const void *a) {
+    (void)e; void *obj = jni_alloc_init(cls, (const FjcMethod *)mid); if (!obj) return NULL;
+    jni_call_a(obj, (const FjcMethod *)mid, a, 'V'); return jni_local(obj);
+}
 
 static void *jni_table[236];                 /* JNINativeInterface_ slot count */
 static void *jni_table_ptr;                  /* = jni_table (JNIEnv is a ptr-to-this) */
@@ -4238,23 +4298,22 @@ static void jni_env_setup(void) {
     jni_table[226] = (void *)jni_bridge_newweakref;
     jni_table[227] = (void *)jni_bridge_noref;           /* DeleteWeakGlobalRef */
     jni_table[228] = (void *)jni_bridge_zero;            /* ExceptionCheck → false */
-    /* method callbacks (native → Java) */
+    /* method callbacks (native → Java): GetMethodID + Call<T>Method{,V,A} + static +
+     * NewObject{,V,A}. The three call forms differ only in arg source (varargs / va_list
+     * / jvalue[]). Slot triples are consecutive (base, base+1=V, base+2=A). */
     jni_table[33]  = (void *)jni_bridge_getmethodid;
     jni_table[113] = (void *)jni_bridge_getmethodid;     /* GetStaticMethodID */
-    jni_table[34]  = (void *)jni_CallObjectMethod;
-    jni_table[37]  = (void *)jni_CallBooleanMethod;
-    jni_table[49]  = (void *)jni_CallIntMethod;
-    jni_table[52]  = (void *)jni_CallLongMethod;
-    jni_table[55]  = (void *)jni_CallFloatMethod;
-    jni_table[58]  = (void *)jni_CallDoubleMethod;
-    jni_table[61]  = (void *)jni_CallVoidMethod;
-    jni_table[114] = (void *)jni_CallStaticObjectMethod;
-    jni_table[117] = (void *)jni_CallStaticBooleanMethod;
-    jni_table[129] = (void *)jni_CallStaticIntMethod;
-    jni_table[132] = (void *)jni_CallStaticLongMethod;
-    jni_table[135] = (void *)jni_CallStaticFloatMethod;
-    jni_table[138] = (void *)jni_CallStaticDoubleMethod;
-    jni_table[141] = (void *)jni_CallStaticVoidMethod;
+    jni_table[28]  = (void *)jni_NewObject;  jni_table[29] = (void *)jni_NewObjectV; jni_table[30] = (void *)jni_NewObjectA;
+#define JSET3(base, nm) jni_table[base] = (void *)jni_Call##nm##Method; \
+    jni_table[(base) + 1] = (void *)jni_Call##nm##MethodV; jni_table[(base) + 2] = (void *)jni_Call##nm##MethodA
+    JSET3(34, Object);  JSET3(37, Boolean); JSET3(49, Int); JSET3(52, Long);
+    JSET3(55, Float);   JSET3(58, Double);  JSET3(61, Void);
+#undef JSET3
+#define JSETS3(base, nm) jni_table[base] = (void *)jni_CallStatic##nm##Method; \
+    jni_table[(base) + 1] = (void *)jni_CallStatic##nm##MethodV; jni_table[(base) + 2] = (void *)jni_CallStatic##nm##MethodA
+    JSETS3(114, Object);  JSETS3(117, Boolean); JSETS3(129, Int); JSETS3(132, Long);
+    JSETS3(135, Float);   JSETS3(138, Double);  JSETS3(141, Void);
+#undef JSETS3
     jni_table_ptr = jni_table;
 }
 

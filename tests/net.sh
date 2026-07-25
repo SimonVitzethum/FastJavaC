@@ -22,7 +22,12 @@ srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", 54488)); srv.listen(1)
 c,_ = srv.accept()
-d = c.recv(64); c.sendall(d); c.close(); srv.close()
+d = b""
+while b"\n" not in d:                 # the client writes byte-by-byte; read until newline
+    chunk = c.recv(64)
+    if not chunk: break
+    d += chunk
+c.sendall(d); c.close(); srv.close()
 ' &
 spid=$!
 sleep 1

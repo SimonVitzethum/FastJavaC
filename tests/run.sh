@@ -246,6 +246,7 @@ if sh "$root/tests/jnifield.sh"; then pass=$((pass+1)); else fail=$((fail+1)); f
 if sh "$root/tests/jnicall.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jniref.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jnistatic.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+if sh "$root/tests/jninew.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/lwjgl.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/lwjgl_smoke.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 if sh "$root/tests/jitmem.sh"; then pass=$((pass+1)); else fail=$((fail+1)); fi
