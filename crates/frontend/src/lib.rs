@@ -863,6 +863,25 @@ fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) ->
     Origin::Opaque
 }
 
+/// Closed-world subtype test: is `sub` assignable to `sup` (via the superclass
+/// chain or implemented/extended interfaces)? Used to fold `Class.isAssignableFrom`
+/// to a compile-time constant. `Object` is a supertype of everything.
+fn is_subtype(program: &Program, sub: &str, sup: &str) -> bool {
+    if sub == sup || sup == "java/lang/Object" {
+        return true;
+    }
+    let Some(ci) = program.class(sub) else {
+        return false;
+    };
+    if ci.interfaces.iter().any(|i| is_subtype(program, i, sup)) {
+        return true;
+    }
+    match ci.super_name.as_deref() {
+        Some(s) => is_subtype(program, s, sup),
+        None => false,
+    }
+}
+
 /// The `jrt_unsafe_*` helper for a (canonical op, value type). Shared by the
 /// `Unsafe` and `VarHandle` frontends — both bottom out in the same atomic memory
 /// layer (the ref helpers carry the RC store barrier). Canonical ops: get, put,
@@ -2423,6 +2442,48 @@ fn lower_block(
                         });
                         continue;
                     }
+                    // Class.isInstance(o): o instanceof the class this Class denotes.
+                    if name == "isInstance" && desc == "(Ljava/lang/Object;)Z" {
+                        let obj = pop!();
+                        let recv = pop!();
+                        let target = match origin_of(&stmts, recv) {
+                            Origin::Op(Operand::ConstClass(c)) => c.clone(),
+                            _ => ml.class_const.get(&recv).cloned().ok_or_else(|| {
+                                FrontendError::Unsupported(
+                                    "Class.isInstance on a not-statically-known Class (closed world)".into(),
+                                )
+                            })?,
+                        };
+                        let l = ml.stack_slot(stack.len(), Ty::I32);
+                        stmts.push(Statement::InstanceOf { dest: l, obj: Operand::Copy(obj), class: target });
+                        stack.push(Ty::I32);
+                        continue;
+                    }
+                    // Class.isAssignableFrom(c): compile-time subtype test — both the
+                    // receiver and argument Class values are statically known.
+                    if name == "isAssignableFrom" && desc == "(Ljava/lang/Class;)Z" {
+                        let arg = pop!();
+                        let recv = pop!();
+                        let sup = match origin_of(&stmts, recv) {
+                            Origin::Op(Operand::ConstClass(c)) => c.clone(),
+                            _ => ml.class_const.get(&recv).cloned().ok_or_else(|| {
+                                FrontendError::Unsupported(
+                                    "Class.isAssignableFrom on a not-statically-known Class (closed world)".into(),
+                                )
+                            })?,
+                        };
+                        let sub = match origin_of(&stmts, arg) {
+                            Origin::Op(Operand::ConstClass(c)) => c.clone(),
+                            _ => ml.class_const.get(&arg).cloned().ok_or_else(|| {
+                                FrontendError::Unsupported(
+                                    "Class.isAssignableFrom argument not a statically-known Class (closed world)".into(),
+                                )
+                            })?,
+                        };
+                        let res = if is_subtype(program, &sub, &sup) { 1 } else { 0 };
+                        push!(Ty::I32, Rvalue::Use(Operand::ConstI32(res)));
+                        continue;
+                    }
                     // newInstance and similar need the statically known target type.
                     let recv = pop!();
                     let target = match origin_of(&stmts, recv) {
@@ -3243,6 +3304,9 @@ fn lower_block(
                     ("java/lang/Math", "sqrt", "(D)D") => Some(("jrt_math_sqrt", Ty::F64)),
                     ("java/lang/System", "currentTimeMillis", "()J") => Some(("jrt_current_time_millis", Ty::I64)),
                     ("java/lang/System", "nanoTime", "()J") => Some(("jrt_nano_time", Ty::I64)),
+                    // Identity hash = the object-header hash (same source as the
+                    // default Object.hashCode); null → 0 is handled in the runtime.
+                    ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => Some(("jrt_obj_hashcode", Ty::I32)),
                     _ => None,
                 };
                 if let Some((func, rty)) = simple {
