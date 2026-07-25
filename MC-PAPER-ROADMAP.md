@@ -112,6 +112,19 @@ parallel execution model — it only edits native code that the CPU runs directl
 > closes it → no leak), verified by a round-trip that hits disk and heap-balances. Nearest next
 > items: `IOException` mapping + try-with-resources `close`, `Object.clone`, `Integer.TYPE`
 > (`int.class`), buffered streams / Readers, then `sun.nio.ch` (the Netty/Paper transport).
+>
+> **Update — `java.io` + `java.net` now COMPILED JAVA STUBS (general mechanism, not per-class
+> intrinsics).** Per the "prefer a general algorithm" directive: the whole char/byte stream
+> stack (`InputStream`/`OutputStream`/`FileInputStream`/`FileOutputStream`/`Reader`/`Writer`/
+> `InputStreamReader`/`OutputStreamWriter`/`BufferedReader.readLine`/`BufferedWriter`/`FileReader`/
+> `FileWriter`) and TCP sockets (`Socket`/`ServerSocket`) live in `stdlib/java/{io,net}` as
+> ordinary Java compiled closed-world, bottoming out in ~10 fd/socket native leaves
+> (`jrt_io_*` + `jrt_net_connect/listen/accept`) reached by the **generic `__fjc_<name>→jrt_<name>`
+> convention** (no per-method Rust; the backend auto-declares the callee). Exceptions are precise
+> (`FileNotFoundException`/`IOException` real objects). try-with-resources works. Adding a JDK
+> class now needs no compiler code — just a stub + (rarely) a new native leaf. This is the
+> scalable path for the rest of the JDK surface. Blocked only by: a UTF-8 char decoder (currently
+> ASCII/Latin1 1:1), `sun.nio.ch` selectors (the async Netty path), and the threaded-lambda crash.
 
 - **Compile the pure-Java OpenJDK classes** (from `jmods`/`src`) with fastjavac. Most of
   `java.util`, `java.io`, `java.nio`, `java.util.stream`, `java.util.concurrent` is pure
